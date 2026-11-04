@@ -1,0 +1,36 @@
+# DNP monitor configuration.
+# Read only when the monitor starts: restart the monitor after editing.
+# The addresses below are placeholders (192.0.2.x is reserved for examples):
+# replace them with your instruments' addresses.
+#
+# Each [MAS3-...] section is one MAS3 controller. Panels are stacked in this
+# order (first = top). The section name is also the log folder name, so keep
+# it unchanged to keep the history.
+#   ip              IPv4 address of the controller
+#   user, password  login used only to READ the pressures from the Manual
+#                   Rotation page (nothing is ever submitted to that page)
+#   read_pressures  yes/no; "no" skips the login and shows spin rate only
+
+[MAS3-test-stand]
+ip = 192.0.2.10
+user = Administrator
+password = admin
+read_pressures = yes
+
+[MAS3-above-console]
+ip = 192.0.2.20
+user = Administrator
+password = admin
+read_pressures = yes
+
+[LakeShore336]
+host = lakeshore336.example.com
+port = 7777
+
+[AMI1700]
+# AMI Model 1700 LN2 level meter on the heat exchanger. Its address is assigned
+# by DHCP: if it changes, read the new one on the instrument's network
+# configuration screen and update ip here. enabled = no hides it.
+ip = 192.0.2.30
+poll_seconds = 60
+enabled = yes

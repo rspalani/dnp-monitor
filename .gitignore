@@ -1,0 +1,15 @@
+# Site-specific settings: real addresses stay on the instrument PC only
+dnp_monitor.conf
+
+# Data and state written by the programs
+mas_logs/
+lakeshore336_logs/
+ami1700_logs/
+exports/
+housekeeping.log
+ami1700_mode.json
+ami1700_mode.json.part
+.dnp_monitor.lock
+
+__pycache__/
+*.pyc
