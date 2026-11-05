@@ -353,8 +353,9 @@ def _last_line_complete(path):
             handle.seek(0, 2)
             if handle.tell() == 0:
                 return True
-            handle.seek(-1, 2)
-            return handle.read(1) == b"\n"
+            handle.seek(max(0, handle.tell() - 65536))
+            tail = handle.read().rstrip(b"\0")       # ignore a NUL-filled tail (see read_plain)
+            return not tail or tail.endswith(b"\n")
     except OSError:
         return True
 
@@ -362,7 +363,8 @@ def _last_line_complete(path):
 def read_plain(path, columns):
     """csv-module reader: (rows, {column: tuple of strings}) for the columns present."""
     with _open_text(path) as handle:
-        reader = csv.reader(handle)
+        # NUL bytes: the tail of a file that was being written during a power cut or hard reset
+        reader = csv.reader(line.replace("\0", "") if "\0" in line else line for line in handle)
         header = next(reader, None)
         if not header:
             return 0, {}
@@ -459,7 +461,13 @@ def iso_to_epochs(values):
 
 def read_file(source, path, use_pandas):
     """One log file -> (epoch seconds, {var key: values}), time-ordered."""
-    count, cols = (read_pandas if use_pandas else read_plain)(path, source.columns)
+    if use_pandas:
+        try:
+            count, cols = read_pandas(path, source.columns)
+        except Exception:            # e.g. a damaged file; the csv-module reader skips what it cannot use
+            count, cols = read_plain(path, source.columns)
+    else:
+        count, cols = read_plain(path, source.columns)
     if count and not _last_line_complete(path):
         count -= 1                       # the monitor is writing that line right now
     empty = np.zeros(0)

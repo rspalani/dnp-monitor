@@ -588,6 +588,14 @@ class ManualRotationReader:
 
 # --- Logging ------------------------------------------------------------------------
 
+def clean_lines(handle):
+    """Lines of a log file without NUL bytes. After a power cut or hard reset the file being written
+    can end in a block of NUL bytes (the file system had reserved the space but not written it),
+    which the csv module refuses to read."""
+    for line in handle:
+        yield line.replace("\0", "") if "\0" in line else line
+
+
 def load_mas_history(folder, name, since_epoch):
     """[(unix_time, spin_hz or NaN)] from this controller's folder; rows naming another controller are skipped and counted."""
     points, foreign = [], 0
@@ -597,8 +605,8 @@ def load_mas_history(folder, name, since_epoch):
         try:
             if path.stat().st_mtime < since_epoch:
                 continue
-            with open(str(path), "r", newline="") as handle:
-                for row in csv.DictReader(handle):
+            with open(str(path), "r", newline="", encoding="utf-8", errors="replace") as handle:
+                for row in csv.DictReader(clean_lines(handle)):
                     try:
                         if row.get("controller") != name:
                             foreign += 1
@@ -609,7 +617,7 @@ def load_mas_history(folder, name, since_epoch):
                             points.append((epoch, float(value) if value else NAN))
                     except (KeyError, TypeError, ValueError):
                         pass
-        except OSError as error:
+        except (OSError, csv.Error) as error:       # a damaged file costs its own rows only
             print("Could not read {}: {}".format(path, error))
     points.sort(key=lambda item: item[0])
     return points, foreign
@@ -1331,15 +1339,15 @@ def load_lakeshore_history(folder, since_epoch):
         try:
             if path.stat().st_mtime < since_epoch:
                 continue
-            with path.open(newline="", encoding="utf-8") as handle:
-                for row in csv.DictReader(handle):
+            with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+                for row in csv.DictReader(clean_lines(handle)):
                     try:
                         epoch = parse_iso(row["timestamp_utc"]).timestamp()
                     except (KeyError, TypeError, ValueError, AttributeError):
                         continue
                     if epoch >= since_epoch:
                         points.append(temperature_point(row, epoch))
-        except OSError as error:
+        except (OSError, csv.Error) as error:       # a damaged file costs its own rows only
             print("Could not read {}: {}".format(path, error))
     points.sort(key=lambda item: item[0])
     return points
