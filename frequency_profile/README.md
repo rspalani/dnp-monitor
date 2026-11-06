@@ -110,13 +110,26 @@ python3 /opt/dnptools/fs_plot.py <dataset>/fs_runs/<run folder>/run.txt
 or without a display, it writes `plot.png` and `values.tsv` and exits;
 `--csv` also writes `records.csv`.
 
+- The top bar has the "Reopen" command (to copy), "Also plot", "Export", and
+  "Hide spectrum", which hides the whole spectrum side and leaves the profile
+  across the window ("Show spectrum" brings it back).
+- Above the profile, the run's status: a blinking red dot and "Experiment
+  running" (with the record reached out of those planned, and the expected
+  end), "Finished", "Stopped before the end" in red when the run was aborted
+  or stopped from TopSpin, or an amber "No new record for N min". "Live"
+  refreshes the window every 15 s; it turns itself off when the run ends and
+  is off when an ended run is opened. "Refresh" updates the window once, for
+  example after reprocessing in TopSpin. Below the status, one row each for
+  the run, the intensity measure and processing, the OFF records, and any
+  warnings.
 - The profile is on the left and one record on the right, with a divider that
   can be dragged. The right side follows the latest record while
   "Follow latest" is ticked; a record chosen in the list, with "< Prev" and
   "Next >" (or Page Up and Page Down), or by clicking a point of the profile
   is shown instead.
-- The controls along the bottom try settings on the record shown: zero- and
-  first-order phase with a pivot, magnitude, polynomial baseline, the
+- The controls along the bottom ("Hide controls" under the spectrum hides
+  them) try settings on the record shown: zero- and first-order phase with a
+  pivot, magnitude, polynomial baseline, the
   intensity window (typed, or dragged with the right mouse button), and the
   intensity measure. "Apply to all records" applies them to the whole profile.
   All of this is in the viewer only; the TopSpin data are unchanged until
@@ -127,11 +140,14 @@ or without a display, it writes `plot.png` and `values.tsv` and exits;
   the FID phase as an optional panel below the profile.
 - "Also plot" adds the integral of the window, or the FID phase.
 - "Export: Profile EPS" writes `profile.eps` for Adobe Illustrator (Helvetica
-  text, one path per trace and per marker, no clipping masks);
-  "Export: CSV" writes `records.csv` (one row per record, with FID(t0), the
-  FID phase, and the window integrals).
-- The window's size, position, and divider are saved in
-  `~/.config/fs_plot/window.txt`, so the next viewer opens in the same place.
+  text, one path per trace and per marker, no clipping masks), 7 in wide, the
+  full page width of ACS journals (Elsevier's is 190 mm), and as high as the
+  profile on screen is in proportion (2 to 5 in). "Export: CSV" writes
+  `records.csv` (one row per record, with FID(t0), the FID phase, and the
+  window integrals).
+- The window's size and position, the divider, and whether the spectrum side
+  is shown are saved in `~/.config/fs_plot/window.txt`, so the next viewer
+  opens the same way.
 
 ## Phasing the TopSpin data after a run
 

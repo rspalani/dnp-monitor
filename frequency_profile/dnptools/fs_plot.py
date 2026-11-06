@@ -36,21 +36,37 @@ values.tsv next to run.txt (<RUNFILE without .txt>_plot.png and _values.tsv
 for an older run file). Without a display, only these files are written, and
 the script exits once the run has ended.
 
-Window: profile, spectrum pane, and controls
-    The window shows the profile on the left and one record in the spectrum
-    pane on the right, with a divider that can be dragged; the controls of
-    the pane are in a strip along the bottom ('Hide controls' in the top bar
-    hides them). The pane shows the latest record while 'Follow latest' is
-    ticked. Choosing a record in the list ('Record'), clicking a point of the
+Window: profile, spectrum side, and controls
+    The window shows the profile on the left and one record on the spectrum
+    side on the right, with a divider that can be dragged; the controls of
+    the spectrum side are in a strip along the bottom ('Hide controls' under
+    the spectrum hides them). 'Hide spectrum' (top bar) hides the whole
+    spectrum side with its controls, leaving the profile across the window.
+
+    Above the profile, the status of the run: a blinking red dot with
+    'Experiment running' while the run goes on (with the record reached out of
+    those planned, from settings.txt in the run folder, and the expected end),
+    'Finished' when fs_core.py has written '# end: complete', 'Stopped before
+    the end' in red when the run was aborted or stopped from TopSpin, and an
+    amber 'No new record for N min' when the run file has no end line but has
+    not grown for much longer than usual. 'Live' refreshes the window every
+    --interval s; it is off from the start for a run that has ended, and turns
+    itself off when the run ends ('Refresh' updates the window once, e.g. after
+    reprocessing; ticking 'Live' again keeps it on). Below that, the run, the
+    intensity measure and processing, the OFF records and any warnings, one row
+    each.
+
+    The spectrum side shows the latest record while 'Follow latest' is
+    ticked. Choosing a record in its list ('Record'), clicking a point of the
     profile (or of the FID phase), or '< Prev' and 'Next >' (also Page Up and
     Page Down) show another record and untick it; so does touching a phase,
     baseline or window control, so that a new record does not replace the one
     being worked on. Ticking it again shows the latest record. Moving between
-    records keeps the zoom. 'Spectrum' and 'FID start' switch the pane between
-    the spectrum and the start of the FID (FID start whenever the mode is
-    switched to FID(t0)). The size and position of the window and of the
-    divider are saved in ~/.config/fs_plot/window.txt when the window is
-    closed, and the next viewer opens the same way.
+    records keeps the zoom. 'Spectrum' and 'FID start' switch between the
+    spectrum and the start of the FID (FID start whenever the mode is switched
+    to FID(t0)). The size and position of the window, the divider, and whether
+    the spectrum side is shown are saved in ~/.config/fs_plot/window.txt when
+    the window is closed, and the next viewer opens the same way.
 
     These settings can be tried on the record shown, with the record as
     processed by TopSpin drawn in grey for comparison:
@@ -122,7 +138,9 @@ EPS export (for Adobe Illustrator)
     .txt>_profile.eps for an older run file), overwriting the previous one: the
     profile as shown (with the window integral and the FID phase if these are
     shown), without the lines above the plot, the grid or the marker of the latest
-    record, over the whole profile. The text is Helvetica text (editable in
+    record, over the whole profile, 7 in wide (the full page width of ACS
+    journals; Elsevier's is 190 mm) and as high as the window's profile is in
+    proportion (2 to 5 in). The text is Helvetica text (editable in
     Illustrator), each trace is one path and each marker its own path, and nothing is
     clipped to the axes, so that Illustrator shows no clipping masks.
 
@@ -987,7 +1005,7 @@ class Analyzer:
                 "n_phase_skipped": len([q for q in results if q["phase_skipped"]]),
                 "fid_mode": fid_mode, "fid_n": int(ph["fid_n"]), "fid_fit": bool(ph["fid_fit"]),
                 "show_fid_phase": bool(ph.get("show_fid_phase")), "need_fid": need_fid,
-                "fid_ref": fid_ref, "latest_fid": latest_fid}
+                "fid_ref": fid_ref, "latest_fid": latest_fid, "plan": run_plan(self.runpath)}
 
     # -- CSV ----------------------------------------------------------------------
     def window_integrals(self, ds_dir, r, ph, center, width):
@@ -1078,19 +1096,22 @@ def window_text(a):
     return "window %.1f +/- %.1f ppm" % (a["center"], a["width"] / 2.0)
 
 
+def grpdly_text(res):
+    grp = sorted(set(r["fid"]["grpdly"] for r in res if r["fid"] and r["fid"]["g"] is not None))
+    if len(grp) == 1:
+        return "GRPDLY %.4g, g = %d" % (grp[0], int(math.ceil(grp[0])))
+    if grp:
+        return "GRPDLY %.4g to %.4g (differs between records)" % (grp[0], grp[-1])
+    return "no usable GRPDLY"
+
+
 def fid_status(a):
     """Lines describing FID(t0) / the FID phase, with the records it could not be computed for."""
     lines = []
     if not (a["fid_mode"] or a["show_fid_phase"]):
         return lines
     res = a["results"]
-    grp = sorted(set(r["fid"]["grpdly"] for r in res if r["fid"] and r["fid"]["g"] is not None))
-    if len(grp) == 1:
-        gtxt = "GRPDLY %.4g, g = %d" % (grp[0], int(math.ceil(grp[0])))
-    elif grp:
-        gtxt = "GRPDLY %.4g to %.4g (differs between records)" % (grp[0], grp[-1])
-    else:
-        gtxt = "no usable GRPDLY"
+    gtxt = grpdly_text(res)
     n = a["fid_n"]
     if a["fid_mode"]:
         how = ("line fitted to |fid[g..g+%d]|, at t = GRPDLY" % (n - 1) if a["fid_fit"]
@@ -1138,6 +1159,130 @@ def spectrum_status(a):
     return lines
 
 
+def run_plan(runpath):
+    """(first, last) planned expno from settings.txt in the run folder (written by fs_core.py),
+    or None (older run files have none)."""
+    if not is_run_folder_layout(runpath):
+        return None
+    try:
+        with open(os.path.join(os.path.dirname(runpath), "settings.txt")) as fh:
+            for line in fh:
+                m = re.match(r"#\s*expnos:\s*(\d+)\.\.(\d+)", line)
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
+def clock(t, now):
+    """HH:MM, with the date if t is not today."""
+    if time.strftime("%Y%m%d", time.localtime(t)) == time.strftime("%Y%m%d", time.localtime(now)):
+        return time.strftime("%H:%M", time.localtime(t))
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+
+def run_state(a, now=None):
+    """State of the run for the window: kind ('running', 'stale', 'complete', 'stopped'),
+    title and detail. 'stale': no end line, but no new record for much longer than usual."""
+    now = time.time() if now is None else now
+    rows = a["results"]
+    times = []
+    for r in rows:
+        try:
+            times.append(time.mktime(time.strptime(r["finished"], "%Y-%m-%d %H:%M:%S")))
+        except Exception:
+            pass
+    plan = a.get("plan")
+    last = max([r["expno"] for r in rows]) if rows else None
+    if plan is not None:
+        done = 0 if last is None else last - plan[0] + 1
+        total = plan[1] - plan[0] + 1
+        parts = ["record %d of %d" % (done, total)]
+    else:
+        done, total = len(rows), None
+        parts = ["%d record%s" % (done, "" if done == 1 else "s")]
+    gaps = np.diff(times[-11:]) if len(times) >= 2 else np.array([])
+    step = float(np.median(gaps)) if gaps.size else None
+    ended = a["ended"]
+    if ended is not None:
+        if times:
+            parts.append("last record %s" % clock(times[-1], now))
+        if ended == "complete":
+            return {"kind": "complete", "title": "Finished", "detail": " · ".join(parts)}
+        return {"kind": "stopped", "title": "Stopped before the end",
+                "detail": " · ".join([ended[len("stopped: "):] if ended.startswith("stopped: ") else ended]
+                                     + parts)}
+    if times:
+        quiet = now - times[-1]
+        limit = max(4 * step, 600) if step else 3600      # s without a new record
+        if quiet > limit:
+            return {"kind": "stale", "title": "No new record for %d min" % (quiet // 60),
+                    "detail": " · ".join(parts + ["last record %s" % clock(times[-1], now),
+                                                  "the run file has no end line: check TopSpin"])}
+        if step and total is not None and done < total:
+            parts.append("ends ≈ %s" % clock(times[-1] + (total - done) * step, now))
+        parts.append("last record %s" % clock(times[-1], now))
+    return {"kind": "running", "title": "Experiment running", "detail": " · ".join(parts)}
+
+
+def profile_info(a, runpath):
+    """Rows (key, text, warn) describing the run and the profile, for the window."""
+    meta, res, fidm = a["meta"], a["results"], a["fid_mode"]
+    rows = []
+    started = meta.get("started", "")
+    run = [x for x in (meta.get("sample", ""), meta.get("conditions", "")) if x]
+    run.append("run %s" % run_label(runpath))
+    run.append("dataset %s" % (os.path.basename(meta.get("dataset_dir", "")) or "?"))
+    if started:
+        run.append("started %s" % started[:16])
+    rows.append(("Run", " · ".join(run), False))
+    win = window_text(a).replace("+/-", "±")
+    if fidm:
+        meas = [mode_label(a["mode"], a), grpdly_text(res), "divided by NS·RG"]
+    else:
+        meas = [win, "%s (%s)" % (a["mode"], MODE_HELP.get(a["mode"], ""))]
+    proc = spectrum_status(a)
+    proc_txt = " · ".join(proc) if proc else "spectra as processed by TopSpin"
+    if fidm:
+        if a["show_integral"]:
+            meas.append("window integral: %s, %s" % (win, proc_txt))
+    else:
+        meas.append(proc_txt)
+        if a["show_integral"] and a["mode"] != "sum":
+            meas.append("window integral also plotted")
+    rows.append(("Measure", " · ".join(meas), False))
+    unit = "per NS·RG" if fidm else "per scan"
+    offs = [r for r in res if r["kind"] == "OFF"]
+    set_ids = sorted(set(r["set"] for r in offs))
+    for s in set_ids[-3:]:
+        txt = []
+        so = None
+        for r in [q for q in offs if q["set"] == s]:
+            if r["value"] is None:
+                txt.append("%s (expno %d): %s" % (r["label"], r["expno"], r["note"]))
+            else:
+                txt.append("%s (expno %d) %.4g %s" % (r["label"], r["expno"], r["value"], unit))
+            if r["label"] == "start" and so is None:
+                so = r
+        eo = [q for q in offs if q["set"] == s and q["label"] == "end"]
+        if so is not None and so["value"] and eo and eo[0]["value"] is not None:
+            txt.append("end/start %.3f" % (eo[0]["value"] / so["value"]))
+        rows.append(("OFF" if len(set_ids) == 1 else "OFF set %d" % s, " · ".join(txt), False))
+    if len(set_ids) > 3:
+        rows.append(("", "(OFF records of the last 3 of %d sets)" % len(set_ids), False))
+    if a["off_mode"] in ("start", "both") and not a["use_enh"]:
+        rows.append(("Warning", "no usable start OFF: the profile shows the intensity per scan", True))
+    for line in fid_status(a):
+        if line.startswith("WARNING: "):
+            rows.append(("Warning", line[len("WARNING: "):], True))
+    bad = [r for r in res if r["kind"] == "ON" and r["value"] is None
+           and not (fidm and r["fid"]["read"] and r["fid"]["g"] is None)]
+    for r in bad[-3:]:
+        rows.append(("Warning", "expno %d: %s" % (r["expno"], r["note"]), True))
+    return rows
+
+
 def write_tsv(path, a):
     if a["fid_mode"]:
         what = "mode %s (intensity_per_scan = FID(t0) / (NS*RG)); integral columns: %s" % (
@@ -1182,7 +1327,6 @@ class Panels:
         self.fig = Figure(figsize=figsize)
         self.with_right = with_right
         self.compact = compact
-        self.title = None
         self.ax1 = self.ax2 = self.ax1b = self.ax3 = None
         self.show_phase = None
         self.layout(False)
@@ -1222,13 +1366,8 @@ class Panels:
         return True
 
     def fit_layout(self):
-        """The window's figure: the title a fixed number of pixels below the top whatever
-        the size of the canvas, the axes below it (plot.png: the top 8 %, see draw)."""
-        hpx = self.fig.get_figheight() * self.fig.dpi
-        if self.title is not None:
-            self.title.set_y(1.0 - 6.0 / hpx)
-            self.title.set_in_layout(False)    # some matplotlib versions make room for it too
-        relayout(self.fig, 0.0, 1.0 - 38.0 / hpx)
+        """The window's figure (no title): the axes fill the canvas."""
+        relayout(self.fig, 0.0, 1.0)
 
 
 def record_what(r, multi):
@@ -1276,7 +1415,8 @@ def draw_fid_record(ax, fid, n, fit, title):
         ax.text(0.02, 0.95, "%s: FID(t0) not computed" % fid["warn"], transform=ax.transAxes,
                 va="top", fontsize=8, color="#8a1c1c")
     ax.set_xlim(start - 0.5, stop - 0.5)
-    ax.set_title(title, fontsize=9)
+    if title:
+        ax.set_title(title, fontsize=9)
     ax.set_xlabel("fid point (complex)")
     ax.set_ylabel("|fid| / (NS*RG)")
 
@@ -1431,13 +1571,12 @@ def draw(p, a, runpath):
             lines.append("%send OFF / start OFF = %.3f%s" % (pre, eo[0]["value"] / so["value"], extra))
     if a["off_mode"] in ("start", "both") and not a["use_enh"]:
         lines.append("start OFF not available: plotting intensity per scan")
-    lines.extend(x for x in phase_status(a)
-                 if not (p.compact and x.startswith("FID phase (lower panel)")))   # the panel says it
+    lines.extend(phase_status(a))
     bad = [r for r in res if r["kind"] == "ON" and r["value"] is None
            and not (fidm and r["fid"]["read"] and r["fid"]["g"] is None)]   # listed by fid_status
     for r in bad[-3:]:
         lines.append("expno %d: %s" % (r["expno"], r["note"]))
-    if lines:
+    if lines and not p.compact:              # the window shows them above the plot instead
         ax1.set_title("\n".join(lines), loc="left", fontsize=8, color="0.25", family="monospace")
 
     # Latest spectrum with the window, or the start of the latest FID
@@ -1474,22 +1613,22 @@ def draw(p, a, runpath):
             ax2.set_ylabel("intensity per scan")
         ax2.axhline(0.0, color="0.8", lw=0.6)
 
+    if p.compact:                            # the window: no title either
+        p.fit_layout()
+        return
     meta = a["meta"]
     status = "running" if a["ended"] is None else a["ended"]
     if fidm:
         what = mode_label(a["mode"], a) + (("; integral: " + window_text(a)) if show_i else "")
     else:
         what = "%s, %s" % (window_text(a), a["mode"])
-    p.title = fig.suptitle("%s  |  %s  |  %s\n%s  |  %s  |  %d ON, %d OFF  |  %s"
+    fig.suptitle("%s  |  %s  |  %s\n%s  |  %s  |  %d ON, %d OFF  |  %s"
                            % (meta.get("sample", ""), meta.get("conditions", ""),
                               os.path.basename(meta.get("dataset_dir", "")) or os.path.dirname(runpath),
                               run_label(runpath), what,
                               len([q for q in res if q["kind"] == "ON"]), len(offs), status),
-                           fontsize=8 if p.compact else 9)
-    if p.compact:
-        p.fit_layout()
-    else:
-        relayout(fig, 0.05 if p.with_text else 0.0, 0.92)    # bottom 5 %: the reopen command
+                           fontsize=9)
+    relayout(fig, 0.05 if p.with_text else 0.0, 0.92)    # bottom 5 %: the reopen command
 
 
 EPS_RC = {
@@ -1543,12 +1682,16 @@ def eps_for_illustrator(ps):
     return "\n".join(out)
 
 
-def write_profile_eps(path, a):
+EPS_WIDTH = 7.0     # in: full page width (two columns) of ACS journals; Elsevier's is 190 mm
+
+
+def write_profile_eps(path, a, aspect=None):
     """The frequency profile as EPS for editing in Adobe Illustrator: the profile (and the
     window integral and the FID phase when they are shown), without the lines above the
     plot, the grid or the marker of the latest record. Each trace is one path and each
     marker its own path; the data are not clipped to the axes (no clipping masks); the
-    text is Helvetica text. The axes span the whole profile."""
+    text is Helvetica text. The axes span the whole profile. Width EPS_WIDTH; height
+    EPS_WIDTH * aspect (height/width of the profile in the window), 2 to 5 in."""
     from matplotlib.backends.backend_ps import FigureCanvasPS
     on = [r for r in a["results"] if r["kind"] == "ON" and r["y"] is not None and r["freq"] is not None]
     if not on:
@@ -1556,7 +1699,8 @@ def write_profile_eps(path, a):
     multi, show_i, fidm = a["multi_set"], a["show_integral"], a["fid_mode"]
     with_ph = a["show_fid_phase"] and any(r["fid"] and r["fid"]["phase_rel"] is not None for r in on)
     with matplotlib.rc_context(EPS_RC):
-        fig = Figure(figsize=(5.0, 4.4 if with_ph else 3.4))
+        h = min(5.0, max(2.0, EPS_WIDTH * aspect)) if aspect else (4.4 if with_ph else 3.2)
+        fig = Figure(figsize=(EPS_WIDTH, h))
         FigureCanvasPS(fig)
         if with_ph:
             gs = fig.add_gridspec(2, 1, height_ratios=[2.6, 1])
@@ -1595,7 +1739,7 @@ def write_profile_eps(path, a):
                 h, l = h + h2, l + l2
             ax1.legend(h, l, fontsize=8, frameon=False, loc="best")
         ax1.ticklabel_format(axis="x", useOffset=False)
-        ax1.xaxis.set_major_locator(MaxNLocator(nbins=5))     # frequencies have 6-7 characters
+        ax1.xaxis.set_major_locator(MaxNLocator(nbins=8))     # frequencies have 6-7 characters
         if ax3 is not None:
             lines.append(ax3.axhline(0.0, color="0.6", lw=0.6, zorder=0))
             ax3.set_ylabel("FID phase (deg)")
@@ -1714,27 +1858,32 @@ MODE_HELP = {
 WINDOW_FILE = os.path.join(os.path.expanduser("~"), ".config", "fs_plot", "window.txt")
 DEFAULT_SIZE = "1270x740"
 PROFILE_FRACTION = 0.55
+STATE_COLORS = {"running": "#d0021b", "stale": "#d68910", "complete": "#7f8c8d", "stopped": "#c0392b"}
 
 
 def load_window_state():
-    """(geometry or None, profile fraction) saved by the last viewer window that was closed."""
-    geo, frac = None, PROFILE_FRACTION
+    """Saved by the last viewer window that was closed: geometry (or None), the share of
+    the width for the profile, and whether the spectrum side was shown."""
+    st = {"geometry": None, "profile_fraction": PROFILE_FRACTION, "spectrum": True}
     try:
         with open(WINDOW_FILE) as fh:
             for line in fh:
                 m = re.match(r"(\w+)\s*=\s*(\S+)$", line.strip())
                 if not m:
                     continue
-                if m.group(1) == "geometry" and re.match(r"^\d+x\d+\+-?\d+\+-?\d+$", m.group(2)):
-                    geo = m.group(2)
-                elif m.group(1) == "profile_fraction":
-                    frac = min(0.85, max(0.15, float(m.group(2))))
+                k, v = m.groups()
+                if k == "geometry" and re.match(r"^\d+x\d+\+-?\d+\+-?\d+$", v):
+                    st["geometry"] = v
+                elif k == "profile_fraction":
+                    st["profile_fraction"] = min(0.85, max(0.15, float(v)))
+                elif k == "spectrum":
+                    st["spectrum"] = v != "0"
     except Exception:
         pass
-    return geo, frac
+    return st
 
 
-def save_window_state(geometry, frac):
+def save_window_state(geometry, frac, spectrum):
     try:
         d = os.path.dirname(WINDOW_FILE)
         if not os.path.isdir(d):
@@ -1742,16 +1891,54 @@ def save_window_state(geometry, frac):
         tmp = WINDOW_FILE + ".tmp"
         with open(tmp, "w") as fh:
             fh.write("# size and position of the last fs_plot.py window that was closed\n"
-                     "geometry = %s\nprofile_fraction = %.3f\n" % (geometry, frac))
+                     "geometry = %s\nprofile_fraction = %.3f\nspectrum = %d\n"
+                     % (geometry, frac, 1 if spectrum else 0))
         os.replace(tmp, WINDOW_FILE)
     except Exception as ex:
         print("[%s] could not save the window position in %s: %s" % (time.strftime("%H:%M:%S"), WINDOW_FILE, ex))
         sys.stdout.flush()
 
 
+class InfoPanel:
+    """Rows 'key   value', the values wrapped to the width of the panel; warnings in red."""
+
+    def __init__(self, parent, key_width=9):
+        self.frame = ttk.Frame(parent)
+        self.frame.columnconfigure(1, weight=1)
+        self.key_width = key_width
+        self.rows = []
+        self.wrap = 300
+        self.frame.bind("<Configure>", self.on_resize)
+
+    def set(self, items):
+        """items: [(key, text, warn)]."""
+        while len(self.rows) < len(items):
+            k = ttk.Label(self.frame, width=self.key_width, foreground=HINT_FG, anchor="nw")
+            v = ttk.Label(self.frame, justify=tk.LEFT, anchor="nw", wraplength=self.wrap)
+            self.rows.append((k, v))
+        for i, (k, v) in enumerate(self.rows):
+            if i < len(items):
+                key, text, warn = items[i]
+                k.configure(text=key, foreground=ERROR_FG if warn else HINT_FG)
+                v.configure(text=text, foreground=ERROR_FG if warn else "#222222")
+                k.grid(row=i, column=0, sticky="nw")
+                v.grid(row=i, column=1, sticky="nw")
+            else:
+                k.grid_remove()
+                v.grid_remove()
+
+    def on_resize(self, event):
+        wrap = max(150, event.width - self.key_width * 8 - 12)
+        if abs(wrap - self.wrap) > 4:
+            self.wrap = wrap
+            for _, v in self.rows:
+                v.configure(wraplength=wrap)
+
+
 class MainWindow:
-    """The profile on the left and the spectrum pane on the right, with a draggable divider;
-    the controls of the spectrum pane in a strip along the bottom."""
+    """The profile on the left and the spectrum side on the right, with a draggable divider;
+    the controls of the spectrum side in a strip along the bottom. 'Hide spectrum' leaves
+    the profile alone across the window."""
 
     def __init__(self, runpath, args, analyzer, reopen, png, tsv):
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -1763,22 +1950,34 @@ class MainWindow:
         self.labels, self.expnos = [], []
         self.user_expno = None          # record chosen by the user; None: the latest
         self.after_id = None
+        self.blink_id = None
         self.controls_shown = True
+        self.spectrum_shown = True
+        self.first_refresh = True
+        self.seen_running = False       # the run was seen without its end line
+        self.state = {"kind": "running", "title": "", "detail": ""}
+        self.updated = None             # time of the last refresh
+        self.blink_on = True
 
         self.root = tk.Tk()
         self.root.title("fs_plot - %s  |  %s" % (run_label(runpath), reopen))
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        geo, self.profile_frac = load_window_state()
-        self.root.geometry(self.checked_geometry(geo))
+        saved = load_window_state()
+        self.profile_frac = saved["profile_fraction"]
+        self.root.geometry(self.checked_geometry(saved["geometry"]))
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        self.bold = bold
 
-        # Top bar: record | also plot | export, controls | reopen command; messages below it
+        # Top bar: reopen command | also plot | export | spectrum side; messages below it
         bar = ttk.Frame(self.root)
         bar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(4, 2))
         self.bar = bar
-        ttk.Label(bar, text="Record").pack(side=tk.LEFT, padx=(4, 4))
-        self.combo = ttk.Combobox(bar, state="disabled", width=30)
-        self.combo.pack(side=tk.LEFT)
-        self.combo.bind("<<ComboboxSelected>>", self.on_select)
+        ttk.Label(bar, text="Reopen:").pack(side=tk.LEFT, padx=(4, 4))
+        self.reopen_entry = ttk.Entry(bar)
+        self.reopen_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.reopen_entry.insert(0, reopen)
+        self.reopen_entry.configure(state="readonly")
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Label(bar, text="Also plot:").pack(side=tk.LEFT)
         self.int_var = tk.IntVar(value=0)
@@ -1792,32 +1991,47 @@ class MainWindow:
         ttk.Button(bar, text="Profile EPS", command=self.save_eps).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="CSV", width=5, command=self.export_csv).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
-        self.ctl_btn = ttk.Button(bar, text="Hide controls", width=13, command=self.toggle_controls)
-        self.ctl_btn.pack(side=tk.LEFT)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
-        ttk.Label(bar, text="Reopen:").pack(side=tk.LEFT)
-        self.reopen_entry = ttk.Entry(bar)
-        self.reopen_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
-        self.reopen_entry.insert(0, reopen)
-        self.reopen_entry.configure(state="readonly")
+        self.spec_btn = ttk.Button(bar, text="Hide spectrum", width=13, command=self.toggle_spectrum)
+        self.spec_btn.pack(side=tk.LEFT, padx=(0, 2))
         self.msg = tk.StringVar(value="")
         self.msg_label = ttk.Label(self.root, textvariable=self.msg, foreground=ERROR_FG)
         self.msg_shown = False
 
-        # Bottom: the controls of the spectrum pane (packed before the plots, so that they
+        # Bottom: the controls of the spectrum side (packed before the plots, so that they
         # keep their height when the window is made smaller)
         self.ctl = ttk.Frame(self.root)
         self.ctl.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6))
-        # Middle: profile | spectrum
+        # Middle: profile | spectrum side
         self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self.paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        left, right = ttk.Frame(self.paned), ttk.Frame(self.paned)
+        left, self.right = ttk.Frame(self.paned), ttk.Frame(self.paned)
         self.paned.add(left, weight=55)
-        self.paned.add(right, weight=45)
+        self.paned.add(self.right, weight=45)
+
+        # Profile side: run status | information | profile
+        st = ttk.Frame(left)
+        st.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(4, 0))
+        self.status_row = st
+        bg = ttk.Style().lookup("TFrame", "background") or "#d9d9d9"
+        self.dot = tk.Canvas(st, width=14, height=14, highlightthickness=0, bg=bg)
+        self.dot_item = self.dot.create_oval(2, 2, 12, 12, fill=STATE_COLORS["running"], outline="")
+        self.dot.pack(side=tk.LEFT)
+        self.dot_bg = bg
+        ttk.Button(st, text="Refresh", width=8, command=self.manual_refresh).pack(side=tk.RIGHT)
+        self.live_var = tk.IntVar(value=1)
+        ttk.Checkbutton(st, text="Live (every %g s)" % self.args.interval, variable=self.live_var,
+                        command=self.on_live).pack(side=tk.RIGHT, padx=(0, 6))
+        self.state_title = ttk.Label(st, text="", font=bold)
+        self.state_title.pack(side=tk.LEFT, padx=(6, 8))
+        self.state_detail = ttk.Label(st, text="", justify=tk.LEFT)
+        self.state_detail.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        st.bind("<Configure>", lambda e: self.wrap_state())
+        self.info = InfoPanel(left)
+        self.info.frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 0))
 
         self.p_png = Panels(reopen)          # plot.png, as without the window (not shown)
         FigureCanvasAgg(self.p_png.fig)
-        self.p = Panels(None, with_right=False, figsize=(7.0, 4.4), compact=True)
+        self.p = Panels(None, with_right=False, figsize=(7.0, 4.0), compact=True)
         self.canvas = FigureCanvasTkAgg(self.p.fig, master=left)
         tbf = ttk.Frame(left)
         tbf.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1827,9 +2041,12 @@ class MainWindow:
         self.canvas.mpl_connect("button_press_event", self.on_click)
         self.canvas.mpl_connect("resize_event", lambda e: self.p.fit_layout())
 
-        self.spec = SpectrumPane(self, right, self.ctl)
-        self.root.bind("<Prior>", lambda e: self.spec.step(-1))
-        self.root.bind("<Next>", lambda e: self.spec.step(1))
+        self.spec = SpectrumPane(self, self.right, self.ctl)
+        self.combo = self.spec.combo
+        self.root.bind("<Prior>", lambda e: self.spectrum_shown and self.spec.step(-1))
+        self.root.bind("<Next>", lambda e: self.spectrum_shown and self.spec.step(1))
+        if not saved["spectrum"]:
+            self.set_spectrum_shown(False)
 
     def checked_geometry(self, geo):
         """The saved geometry; only its size if its position is off the screen(s)."""
@@ -1845,26 +2062,35 @@ class MainWindow:
     def run(self):
         self.after_id = self.root.after(10, self.refresh)
         self.root.after(150, self.place_divider)
+        self.blink_id = self.root.after(600, self.blink)
         self.root.mainloop()
 
     def place_divider(self):
+        if not self.spectrum_shown:
+            return
         self.root.update_idletasks()
         w = self.paned.winfo_width()
         if w > 100:
             self.paned.sashpos(0, int(w * self.profile_frac))
 
+    def remember_divider(self):
+        if self.spectrum_shown:
+            w = self.paned.winfo_width()
+            if w > 100:
+                self.profile_frac = min(0.85, max(0.15, self.paned.sashpos(0) / float(w)))
+
     def close(self):
         try:
-            w = self.paned.winfo_width()
-            frac = self.paned.sashpos(0) / float(w) if w > 100 else self.profile_frac
-            save_window_state(self.root.wm_geometry(), frac)
+            self.remember_divider()
+            save_window_state(self.root.wm_geometry(), self.profile_frac, self.spectrum_shown)
         except Exception:
             pass
-        if self.after_id is not None:
-            try:
-                self.root.after_cancel(self.after_id)
-            except Exception:
-                pass
+        for aid in (self.after_id, self.blink_id):
+            if aid is not None:
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
         self.root.quit()
         self.root.destroy()
 
@@ -1879,20 +2105,60 @@ class MainWindow:
             self.msg_label.pack_forget()
             self.msg_shown = False
 
+    # -- spectrum side and controls --------------------------------------------
+    def toggle_spectrum(self):
+        self.set_spectrum_shown(not self.spectrum_shown)
+
+    def set_spectrum_shown(self, show):
+        if show == self.spectrum_shown:
+            return
+        if show:
+            self.paned.add(self.right, weight=45)
+            if self.controls_shown:
+                self.ctl.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6), before=self.paned)
+            self.spec_btn.configure(text="Hide spectrum")
+            self.spectrum_shown = True
+            self.root.after(50, self.place_divider)
+        else:
+            self.remember_divider()
+            self.paned.forget(self.right)
+            self.ctl.pack_forget()
+            self.spec_btn.configure(text="Show spectrum")
+            self.spectrum_shown = False
+
     def toggle_controls(self):
         if self.controls_shown:
             self.ctl.pack_forget()
-            self.ctl_btn.configure(text="Show controls")
-        else:
+        elif self.spectrum_shown:
             self.ctl.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6), before=self.paned)
-            self.ctl_btn.configure(text="Hide controls")
         self.controls_shown = not self.controls_shown
+        self.spec.ctl_btn.configure(text="Hide controls" if self.controls_shown else "Show controls")
+
+    # -- updates -------------------------------------------------------------
+    def cancel_refresh(self):
+        if self.after_id is not None:
+            try:
+                self.root.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+
+    def on_live(self):
+        self.cancel_refresh()
+        if self.live_var.get():
+            self.refresh()
+        else:
+            self.show_state()
+
+    def manual_refresh(self):
+        self.refresh(reschedule=False)
 
     def refresh(self, reschedule=True):
         try:
             phase_changed = self.analyzer.load_phase()
             a = self.analyzer.run(force_fid=getattr(self.args, "csv", False))
             self.last_a = a
+            self.updated = time.time()
             sig = signature(self.runpath, a)
             if sig != self.last_sig:
                 update_outputs(self.p_png, a, self.runpath, self.png, self.tsv, self.analyzer, self.args)
@@ -1901,21 +2167,68 @@ class MainWindow:
                 if self.p.show_phase != layout:
                     self.toolbar.update()          # new axes: clear the zoom history
                 self.canvas.draw_idle()
+                self.info.set(profile_info(a, self.runpath))
                 self.last_sig = sig
             self.update_records(a)
             self.int_var.set(1 if self.analyzer.phase.get("show_integral") else 0)
             self.fph_var.set(1 if self.analyzer.phase.get("show_fid_phase") else 0)
             self.spec.sync(a, phase_changed == "proc", self.selected_row())
+            # Live: off from the start for a run that has ended; off when the run ends
+            if a["ended"] is None:
+                self.seen_running = True
+            elif self.live_var.get() and (self.first_refresh or self.seen_running):
+                self.live_var.set(0)
+                self.seen_running = False
+                self.cancel_refresh()
+                reschedule = False
+            self.first_refresh = False
+            self.show_state()
         except Exception as ex:  # keep the window alive through a transient read error
             print("[%s] update failed: %s" % (time.strftime("%H:%M:%S"), ex))
             sys.stdout.flush()
-        if reschedule:
+        if reschedule and self.live_var.get():
+            self.cancel_refresh()
             self.after_id = self.root.after(int(self.args.interval * 1000), self.refresh)
+
+    def show_state(self):
+        """The status row: dot, title and detail of the run."""
+        if self.last_a is None:
+            return
+        st = run_state(self.last_a)
+        detail = st["detail"]
+        if self.updated is not None:
+            if st["kind"] in ("running", "stale") and not self.live_var.get():
+                detail += " · Live is off: not updated since %s" % time.strftime("%H:%M:%S", time.localtime(self.updated))
+            else:
+                detail += " · updated %s" % time.strftime("%H:%M:%S", time.localtime(self.updated))
+        self.state = st
+        color = STATE_COLORS[st["kind"]]
+        self.state_title.configure(text=st["title"], foreground=color if st["kind"] != "complete" else "#222222")
+        self.state_detail.configure(text=detail, foreground=ERROR_FG if st["kind"] == "stopped" else "#222222")
+        self.dot.itemconfigure(self.dot_item, fill=color)
+        self.wrap_state()
+
+    def wrap_state(self):
+        """Wraps the detail of the status row to the room left by the other widgets."""
+        st = self.status_row
+        used = sum(w.winfo_reqwidth() for w in st.winfo_children() if w is not self.state_detail) + 40
+        self.state_detail.configure(wraplength=max(150, st.winfo_width() - used))
+
+    def blink(self):
+        """The red dot blinks while the run is going and the window is live."""
+        if self.state["kind"] == "running" and self.live_var.get():
+            self.blink_on = not self.blink_on
+            self.dot.itemconfigure(self.dot_item,
+                                   fill=STATE_COLORS["running"] if self.blink_on else self.dot_bg)
+        elif not self.blink_on:
+            self.blink_on = True
+            self.dot.itemconfigure(self.dot_item, fill=STATE_COLORS[self.state["kind"]])
+        self.blink_id = self.root.after(600, self.blink)
 
     # -- record list --------------------------------------------------------
     def update_records(self, a):
         """The list holds the records with a spectrum; it shows the record chosen by the
-        user, or the latest one while the spectrum pane follows the latest record."""
+        user, or the latest one while the spectrum side follows the latest record."""
         rows = [r for r in a["results"] if r["readable"]]
         labels = [record_label(r, a["multi_set"]) for r in rows]
         expnos = [r["expno"] for r in rows]
@@ -1941,8 +2254,8 @@ class MainWindow:
         return None
 
     def show_record(self, expno):
-        """Shows expno in the spectrum pane, which stops following the latest record.
-        Returns False if the expno has no spectrum."""
+        """Shows expno on the spectrum side (shown if hidden), which stops following the
+        latest record. Returns False if the expno has no spectrum."""
         if expno not in self.expnos:
             return False
         self.user_expno = expno
@@ -1953,6 +2266,7 @@ class MainWindow:
         r = self.selected_row()
         if r is None:
             return False
+        self.set_spectrum_shown(True)
         self.spec.show(r)
         return True
 
@@ -2000,9 +2314,12 @@ class MainWindow:
 
     def save_eps(self):
         path = eps_path(self.runpath)
+        w = self.canvas.get_tk_widget()
+        aspect = w.winfo_height() / float(max(1, w.winfo_width()))
         try:
-            write_profile_eps(path, self.last_a)
-            self.set_msg("Wrote %s (the profile as shown, for Adobe Illustrator)" % path, error=False)
+            write_profile_eps(path, self.last_a, aspect)
+            self.set_msg("Wrote %s (%.1f x %.1f in, the profile as shown, for Adobe Illustrator)"
+                         % (path, EPS_WIDTH, min(5.0, max(2.0, EPS_WIDTH * aspect))), error=False)
         except Exception as ex:
             self.set_msg("Could not write %s: %s" % (path, ex))
 
@@ -2062,25 +2379,30 @@ class SpectrumPane:
             for ev in ("<Return>", "<KP_Enter>", "<FocusOut>"):
                 entry.bind(ev, lambda e: fn())
 
-        # Top: navigation and following (the record label is packed last, so that it is the
-        # one shortened when the pane is narrow)
+        # Top: record list, navigation and following; then what the record shows
         nav = ttk.Frame(parent)
-        nav.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 0))
-        self.prev_btn = ttk.Button(nav, text="< Prev", width=7, command=lambda: self.step(-1))
-        self.prev_btn.pack(side=tk.LEFT)
-        self.next_btn = ttk.Button(nav, text="Next >", width=7, command=lambda: self.step(1))
-        self.next_btn.pack(side=tk.LEFT, padx=(2, 0))
-        self.follow_var = tk.IntVar(value=1)
+        nav.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(4, 0))
+        self.follow_var = tk.IntVar(value=1)            # packed first: kept when the pane is narrow
         ttk.Checkbutton(nav, text="Follow latest", variable=self.follow_var,
-                        command=self.on_follow).pack(side=tk.LEFT, padx=(8, 0))
-        self.rec_var = tk.StringVar(value="")
-        bold = tkfont.nametofont("TkDefaultFont").copy()
-        bold.configure(weight="bold")
-        ttk.Label(nav, textvariable=self.rec_var, font=bold).pack(side=tk.LEFT, padx=8)
+                        command=self.on_follow).pack(side=tk.RIGHT, padx=(6, 2))
+        ttk.Label(nav, text="Record").pack(side=tk.LEFT, padx=(2, 4))
+        self.combo = ttk.Combobox(nav, state="disabled", width=20)
+        self.combo.pack(side=tk.LEFT)
+        self.combo.bind("<<ComboboxSelected>>", main.on_select)
+        self.prev_btn = ttk.Button(nav, text="< Prev", width=6, command=lambda: self.step(-1))
+        self.prev_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.next_btn = ttk.Button(nav, text="Next >", width=6, command=lambda: self.step(1))
+        self.next_btn.pack(side=tk.LEFT, padx=(2, 0))
+        self.pos_var = tk.StringVar(value="")
+        ttk.Label(nav, textvariable=self.pos_var, foreground=HINT_FG).pack(side=tk.LEFT, padx=(6, 0))
+        self.info = InfoPanel(parent, key_width=8)
+        self.info.frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 0))
 
         # Below the plot: the view switch, at the right of the zoom toolbar
         tbf = ttk.Frame(parent)
         tbf.pack(side=tk.BOTTOM, fill=tk.X)
+        self.ctl_btn = ttk.Button(tbf, text="Hide controls", width=13, command=main.toggle_controls)
+        self.ctl_btn.pack(side=tk.RIGHT, padx=(6, 4))
         self.view_var = tk.StringVar(value="spectrum")
         ttk.Radiobutton(tbf, text="FID start", value="fid", variable=self.view_var,
                         command=self.on_view).pack(side=tk.RIGHT, padx=(0, 6))
@@ -2266,6 +2588,7 @@ class SpectrumPane:
         except Exception as ex:
             self.spec = None
             if view == "spectrum":
+                self.info.set([("Value", "expno %d: %s" % (row["expno"], ex), True)])
                 self.ax.clear()
                 self.drawn = None
                 self.ax.text(0.5, 0.5, "expno %d: %s" % (row["expno"], ex), transform=self.ax.transAxes,
@@ -2315,13 +2638,16 @@ class SpectrumPane:
         self.drawn = "fid"
         try:
             fid = self.main.analyzer.fid(a["ds_dir"], row["expno"])
-            draw_fid_record(ax, fid, int(tr["fid_n"]), bool(tr["fid_fit"]),
-                            "expno %d, %s: start of the FID\n%s" % (row["expno"], self.what, self.fid_text()))
+            draw_fid_record(ax, fid, int(tr["fid_n"]), bool(tr["fid_fit"]), None)
             if xl is not None:
                 ax.set_xlim(xl)
         except Exception as ex:
             ax.text(0.5, 0.5, "expno %d: %s" % (row["expno"], ex), transform=ax.transAxes,
                     ha="center", va="center", color="0.3")
+        self.info.set([("Value", self.fid_text(), False),
+                       ("Shows", "start of the FID: |fid| / (NS·RG) against the point index; "
+                                 "N %d, %s" % (int(tr["fid_n"]), "line fitted, at t = GRPDLY" if tr["fid_fit"]
+                                               else "mean"), False)])
         relayout(self.fig)
         self.canvas.draw_idle()
         self.update_status()
@@ -2340,9 +2666,7 @@ class SpectrumPane:
         i = ex.index(self.row["expno"]) if self.row is not None and self.row["expno"] in ex else None
         self.prev_btn.configure(state="normal" if i is not None and i > 0 else "disabled")
         self.next_btn.configure(state="normal" if i is not None and i < len(ex) - 1 else "disabled")
-        if self.row is not None:
-            self.rec_var.set("%d   %s%s" % (self.row["expno"], self.what,
-                                            "   (%d/%d)" % (i + 1, len(ex)) if i is not None else ""))
+        self.pos_var.set("%d/%d" % (i + 1, len(ex)) if i is not None else "")
 
     def on_follow(self):
         m = self.main
@@ -2389,9 +2713,9 @@ class SpectrumPane:
         v = m["fit"] if tr["fid_fit"] else m["mean"]
         if v is None:
             return "FID(t0): the linear fit needs N >= 2"
-        s = "FID(t0) %.4g per NS*RG, phase %+.1f deg" % (v, m["phase"])
+        s = "FID(t0) %.4g per NS·RG · FID phase %+.1f°" % (v, m["phase"])
         if a["fid_ref"] is not None:
-            s += " (%+.1f from the ON median)" % wrap_pm180(m["phase"] - a["fid_ref"])
+            s += " (%+.1f° from the ON median)" % wrap_pm180(m["phase"] - a["fid_ref"])
         return s
 
     def redraw(self, draw=True, fit=False):
@@ -2411,15 +2735,16 @@ class SpectrumPane:
         val_txt = ""
         if fid:
             self.l_point.set_data([], [])
+            val_txt = self.fid_text()
             try:
-                val_txt = "window integral %.4g" % integrate(spec["ppm"], y, tr["center"], tr["width"])
+                val_txt += " · window integral %.4g" % integrate(spec["ppm"], y, tr["center"], tr["width"])
             except Exception as ex:
                 notes.append(str(ex))
         else:
             try:
                 val, at = measure(spec["ppm"], y, tr["center"], tr["width"], tr["mode"])
-                val_txt = "per scan: %s %.4g, integral %.4g" % (
-                    tr["mode"], val, integrate(spec["ppm"], y, tr["center"], tr["width"]))
+                val_txt = "%s %.4g per scan · integral %.4g · NS %d" % (
+                    tr["mode"], val, integrate(spec["ppm"], y, tr["center"], tr["width"]), spec["ns"])
                 if at is not None:
                     self.l_point.set_data([at], [val])
                 else:
@@ -2430,17 +2755,18 @@ class SpectrumPane:
         self.l_pivot.set_xdata([tr["pivot"], tr["pivot"]])
         self.l_pivot.set_visible(not (tr["magnitude"] or fid))
         self.draw_span()
-        if fid:                                   # FID(t0) and its phase on the second line
-            settings = self.fid_text()
+        if fid:
+            settings = "FID(t0), N %d, %s; the spectrum is shown with the settings below" % (
+                int(tr["fid_n"]), "line fitted, at t = GRPDLY" if tr["fid_fit"] else "mean")
         else:
             if tr["magnitude"]:
                 settings = "magnitude"
             else:
-                settings = "PH0 %+.1f, PH1 %+.1f deg, pivot %.2f ppm" % (tr["ph0"], tr["ph1"], tr["pivot"])
-            settings += "%s  |  %s" % (", baseline" if tr["baseline"] else "",
-                                       window_desc(tr["center"], tr["width"]))
-        self.ax.set_title("expno %d, %s (NS %d)  |  %s\n%s"
-                          % (self.row["expno"], self.what, spec["ns"], val_txt, settings), fontsize=9)
+                settings = "PH0 %+.1f°, PH1 %+.1f°, pivot %.2f ppm" % (tr["ph0"], tr["ph1"], tr["pivot"])
+            settings += " · %s · %s" % ("baseline order %d" % tr["order"] if tr["baseline"] else "no baseline",
+                                        window_desc(tr["center"], tr["width"]).replace("+/-", "±"))
+        self.ax.set_title("")
+        self.info.set([("Value", val_txt, False), ("Settings", settings, False)])
         self.update_status(notes)
         if fit:
             self.fit_y(draw=False)
