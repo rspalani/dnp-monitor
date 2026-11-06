@@ -155,6 +155,34 @@ CSV export
     'CommentStyle', '#'); pandas: read_csv(f, comment='#')). With --csv the file is
     rewritten whenever the PNG and TSV are.
 
+Build-up runs
+    A run file with '# type = buildup' (written by bu.py through fs_core.py) has
+    one record per build-up time D1 (eighth column), ON (microwaves on) or OFF.
+    The window and plot.png then show the intensity per scan (or FID(t0) per
+    NS*RG) of the ON and OFF records against D1, each series of each set with a
+    fitted curve, chosen with 'Fit' (main window):
+      mono-exponential               S_inf*(1 - exp(-D1/T_B))   (default)
+      mono-exponential, free start   S_inf - (S_inf - S_0)*exp(-D1/T_B), for a
+                                     saturation that leaves S_0
+      stretched exponential          S_inf*(1 - exp(-(D1/T_B)^beta)), beta 0.1 to 3
+      bi-exponential                 S_1*(1 - exp(-D1/T_1)) + S_2*(1 - exp(-D1/T_2))
+    The fits are least squares weighted by NS (the noise of an intensity per scan
+    goes as 1/sqrt(NS)), with standard errors from the scatter about the fit. For
+    each fit the largest signal per square root of the build-up time, S/sqrt(D1),
+    is given with the D1 where it occurs (1.26 T_B for the mono-exponential; for
+    the free start, from the rise above S_0); with ON and OFF in the same set,
+    also the ratios S_inf(ON)/S_inf(OFF) and of these maxima. With ON and OFF
+    shown, OFF is on a right-hand axis; 'normalized' divides each series by its
+    fitted S_inf instead, on one axis, to compare the build-up times. 'log D1'
+    makes the D1 axis logarithmic. The record pane, its phase, baseline and
+    window settings, FID(t0), the FID phase and the exports work as for a
+    profile; the window integral is not plotted. values.tsv then has the D1 and
+    the fitted value of each record and the fit results in its header,
+    records.csv a d1_s column, and 'Export: Build-up EPS' writes buildup.eps.
+    The expected end of a running build-up is the sum of the expected durations
+    of the records still to come (from settings.txt), and the run counts as
+    quiet only when the next record is overdue.
+
 The terminal command that reopens this plot for this run file (including any
 --ppm, --width, --mode and --csv given) is shown in the window title, in the
 'Reopen' field of the top bar (to copy), along the bottom of plot.png, and in the
@@ -176,7 +204,7 @@ from collections import OrderedDict
 import numpy as np
 import matplotlib
 from matplotlib.figure import Figure
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 try:
@@ -219,12 +247,18 @@ def read_run(path):
                     "ns_run": int(parts[4]),
                     "finished": parts[5] if len(parts) > 5 else "",
                     "set": 1,
+                    "d1": None,
                 }
             except ValueError:
                 continue
             if len(parts) > 6:
                 try:
                     row["set"] = int(parts[6])
+                except ValueError:
+                    pass
+            if len(parts) > 7:                  # build-up runs: D1 in s
+                try:
+                    row["d1"] = float(parts[7])
                 except ValueError:
                     pass
             rows.append(row)
@@ -474,7 +508,8 @@ def default_phase():
     return {"ph0": 0.0, "ph1": 0.0, "pivot": None, "base0": None, "base1": None,
             "baseline": False, "order": 3, "magnitude": False,
             "win_set": False, "center": None, "width": 20.0, "mode": "extreme",
-            "show_integral": False, "fid_n": 4, "fid_fit": False, "show_fid_phase": False}
+            "show_integral": False, "fid_n": 4, "fid_fit": False, "show_fid_phase": False,
+            "fit_model": "mono", "log_d1": False, "normalize": False}
 
 
 def phase_active(ph):
@@ -483,7 +518,8 @@ def phase_active(ph):
 
 def phase_key(ph):
     """Changes whenever any viewer setting changes."""
-    return proc_key(ph) + (bool(ph.get("show_integral")), bool(ph.get("show_fid_phase")))
+    return proc_key(ph) + (bool(ph.get("show_integral")), bool(ph.get("show_fid_phase")),
+                           ph.get("fit_model", "mono"), bool(ph.get("log_d1")), bool(ph.get("normalize")))
 
 
 def proc_key(ph):
@@ -635,11 +671,12 @@ def phase_file_path(runpath):
     return output_paths(runpath)[2]
 
 
-def eps_path(runpath):
-    """profile.eps next to run.txt, or <run file without .txt>_profile.eps."""
+def eps_path(runpath, buildup=False):
+    """profile.eps (buildup.eps) next to run.txt, or <run file without .txt>_profile.eps."""
+    name = "buildup.eps" if buildup else "profile.eps"
     if is_run_folder_layout(runpath):
-        return os.path.join(os.path.dirname(runpath), "profile.eps")
-    return (runpath[:-4] if runpath.endswith(".txt") else runpath) + "_profile.eps"
+        return os.path.join(os.path.dirname(runpath), name)
+    return (runpath[:-4] if runpath.endswith(".txt") else runpath) + "_" + name
 
 
 def csv_path(runpath):
@@ -698,6 +735,10 @@ def read_phase_file(path):
     ph["fid_n"] = max(1, min(FID_HEAD, int(num("fid_points", 4))))
     ph["fid_fit"] = bool(int(num("fid_fit", 0)))
     ph["show_fid_phase"] = bool(int(num("show_fid_phase", 0)))
+    if vals.get("fit_model") in FIT_MODELS:
+        ph["fit_model"] = vals["fit_model"]
+    ph["log_d1"] = bool(int(num("log_d1", 0)))
+    ph["normalize"] = bool(int(num("normalize", 0)))
     if "window_width" in vals:
         ph["win_set"] = True
         ph["center"] = num("window_center", None)
@@ -723,20 +764,359 @@ def write_phase_file(path, ph, runpath):
         "# present, replace the intensity window of the run file. show_integral = 1 also\n"
         "# plots the integral of the window. fid_points (N) and fid_fit (1 = linear fit\n"
         "# to t = GRPDLY) set mode FID(t0); show_fid_phase = 1 shows the FID phase panel.\n"
+        "# Build-up runs: fit_model (mono, offset, stretched, biexp), log_d1 = 1 for a\n"
+        "# logarithmic D1 axis, normalize = 1 to divide each series by its fitted S_inf.\n"
         "# fs_rephase.py (TopSpin)\n"
         "# applies the phase to the TopSpin data; everything else stays in the viewer.\n"
         "ph0 = %s\nph1 = %s\npivot_ppm = %s\nbase_phc0 = %s\nbase_phc1 = %s\n"
         "baseline = %d\nbaseline_order = %d\nmagnitude = %d\nshow_integral = %d\n"
-        "fid_points = %d\nfid_fit = %d\nshow_fid_phase = %d\n%s"
+        "fid_points = %d\nfid_fit = %d\nshow_fid_phase = %d\n"
+        "fit_model = %s\nlog_d1 = %d\nnormalize = %d\n%s"
         % (run_label(runpath), time.strftime("%Y-%m-%d %H:%M:%S"),
            v(ph["ph0"]), v(ph["ph1"]), v(ph["pivot"]), v(ph["base0"]), v(ph["base1"]),
            1 if ph["baseline"] else 0, int(ph["order"]), 1 if ph["magnitude"] else 0,
            1 if ph.get("show_integral") else 0, int(ph.get("fid_n", 4)),
-           1 if ph.get("fid_fit") else 0, 1 if ph.get("show_fid_phase") else 0, window))
+           1 if ph.get("fid_fit") else 0, 1 if ph.get("show_fid_phase") else 0,
+           ph.get("fit_model", "mono"), 1 if ph.get("log_d1") else 0, 1 if ph.get("normalize") else 0,
+           window))
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         fh.write(text)
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# Build-up fits
+# --------------------------------------------------------------------------
+FIT_MODELS = OrderedDict([
+    ("mono", "mono-exponential"),
+    ("offset", "mono-exponential, free start"),
+    ("stretched", "stretched exponential"),
+    ("biexp", "bi-exponential"),
+])
+FIT_FORMULAS = {                          # ASCII, for the TSV, the CSV and the PNG
+    "mono": "S_inf*(1 - exp(-D1/T_B))",
+    "offset": "S_inf - (S_inf - S_0)*exp(-D1/T_B)",
+    "stretched": "S_inf*(1 - exp(-(D1/T_B)^beta))",
+    "biexp": "S_1*(1 - exp(-D1/T_1)) + S_2*(1 - exp(-D1/T_2)), S_inf = S_1 + S_2",
+}
+FIT_FORMULAS_UI = {                       # for the window
+    "mono": "S∞·(1 − exp(−D1/T_B))",
+    "offset": "S∞ − (S∞ − S₀)·exp(−D1/T_B)",
+    "stretched": "S∞·(1 − exp(−(D1/T_B)^β))",
+    "biexp": "S₁·(1 − exp(−D1/T₁)) + S₂·(1 − exp(−D1/T₂))",
+}
+FIT_NPAR = {"mono": 2, "offset": 3, "stretched": 3, "biexp": 4}
+# x = t/T_B where (1 - exp(-x))/sqrt(x) is largest: exp(-x)*(2x + 1) = 1
+SENS_X = 1.2564312086261697
+
+
+def fit_model_value(model, p, t):
+    """The fitted curve at the build-up times t (array)."""
+    t = np.asarray(t, dtype=float)
+    if model == "mono":
+        return p[0] * -np.expm1(-t / p[1])
+    if model == "offset":
+        return p[0] - (p[0] - p[1]) * np.exp(-t / p[2])
+    if model == "stretched":
+        return p[0] * -np.expm1(-(t / p[1]) ** p[2])
+    return p[0] * -np.expm1(-t / p[1]) + p[2] * -np.expm1(-t / p[3])
+
+
+def _fit_basis(model, q, t):
+    """Columns of the linear amplitudes for the nonlinear parameters q (times, beta)."""
+    if model == "mono":
+        return [-np.expm1(-t / q[0])]
+    if model == "offset":
+        e = np.exp(-t / q[0])
+        return [1.0 - e, e]
+    if model == "stretched":
+        return [-np.expm1(-(t / q[0]) ** q[1])]
+    return [-np.expm1(-t / q[0]), -np.expm1(-t / q[1])]
+
+
+def _amplitudes(cols, y, sw):
+    """Weighted least squares amplitudes for the columns, and the weighted sum of squares."""
+    A = np.column_stack(cols) * sw[:, None]
+    coef = np.linalg.lstsq(A, y * sw, rcond=None)[0]
+    r = y * sw - A.dot(coef)
+    return coef, float(r.dot(r))
+
+
+def _nelder_mead(f, x0, step, iters=800):
+    """Minimises f from x0 (simplex with edges step); returns (x, f(x))."""
+    n = len(x0)
+    pts = [np.array(x0, dtype=float)]
+    for i in range(n):
+        x = np.array(x0, dtype=float)
+        x[i] += step[i]
+        pts.append(x)
+    vals = [f(x) for x in pts]
+    for _ in range(iters):
+        order = np.argsort(vals)
+        pts = [pts[i] for i in order]
+        vals = [vals[i] for i in order]
+        if abs(vals[-1] - vals[0]) <= 1e-12 * (abs(vals[0]) + 1e-300) and \
+                max(np.max(np.abs(p - pts[0])) for p in pts[1:]) < 1e-9:
+            break
+        c = np.mean(pts[:-1], axis=0)
+        xr = c + (c - pts[-1])
+        fr = f(xr)
+        if fr < vals[0]:
+            xe = c + 2.0 * (c - pts[-1])
+            fe = f(xe)
+            pts[-1], vals[-1] = (xe, fe) if fe < fr else (xr, fr)
+        elif fr < vals[-2]:
+            pts[-1], vals[-1] = xr, fr
+        else:
+            xc = c + 0.5 * (pts[-1] - c) if fr >= vals[-1] else c + 0.5 * (xr - c)
+            fc = f(xc)
+            if fc < min(fr, vals[-1]):
+                pts[-1], vals[-1] = xc, fc
+            else:
+                pts = [pts[0]] + [pts[0] + 0.5 * (p - pts[0]) for p in pts[1:]]
+                vals = [vals[0]] + [f(p) for p in pts[1:]]
+    i = int(np.argmin(vals))
+    return pts[i], vals[i]
+
+
+def fit_buildup(t, y, w, model):
+    """Weighted least squares fit of the build-up y(t) (weights w: NS, as the noise of an
+    intensity per scan goes as 1/sqrt(NS)). The amplitudes are linear; the times (and beta)
+    are searched on a grid over 1/30 of the shortest to 30 times the longest D1, then
+    refined. Returns a dict (see the end); raises ValueError if there are too few points."""
+    t, y, w = (np.asarray(v, dtype=float) for v in (t, y, w))
+    k = FIT_NPAR[model]
+    if t.size < k:
+        raise ValueError("%d point%s; the %s fit needs at least %d"
+                         % (t.size, "" if t.size == 1 else "s", FIT_MODELS[model], k))
+    sw = np.sqrt(w / np.mean(w))
+    tmin, tmax = float(t.min()), float(t.max())
+    lo, hi = math.log(tmin / 30.0), math.log(tmax * 30.0)
+    big = 1e300
+
+    def cost(u):                          # u: log of the times; for stretched also log(beta)
+        if model == "stretched":
+            if not (lo - 1 < u[0] < hi + 1 and math.log(0.1) <= u[1] <= math.log(3.0)):
+                return big
+            q = [math.exp(u[0]), math.exp(u[1])]
+        else:
+            if any(not (lo - 1 < x < hi + 1) for x in u):
+                return big
+            q = sorted(math.exp(x) for x in u)
+        return _amplitudes(_fit_basis(model, q, t), y, sw)[1]
+
+    grid = np.linspace(lo, hi, 121)
+    if model == "biexp":
+        g = grid[::4]
+        u0 = min(([a, b] for i, a in enumerate(g) for b in g[i + 1:]), key=cost)
+        starts = [u0]
+    elif model == "stretched":
+        u0 = min(grid, key=lambda x: cost([x, 0.0]))
+        starts = [[u0, 0.0], [u0, math.log(0.5)], [u0, math.log(1.5)]]
+    else:
+        starts = [[min(grid, key=lambda x: cost([x]))]]
+    best = None
+    for s in starts:
+        u, c = _nelder_mead(cost, s, [0.3] * len(s))
+        if best is None or c < best[1]:
+            best = (u, c)
+    u, chi2 = best
+    if model == "stretched":
+        q = [math.exp(u[0]), math.exp(u[1])]
+    else:
+        q = sorted(math.exp(x) for x in u)
+    amp = _amplitudes(_fit_basis(model, q, t), y, sw)[0]
+    if model == "mono":
+        p = np.array([amp[0], q[0]])
+    elif model == "offset":
+        p = np.array([amp[0], amp[1], q[0]])
+    elif model == "stretched":
+        p = np.array([amp[0], q[0], q[1]])
+    else:
+        p = np.array([amp[0], q[0], amp[1], q[1]])
+
+    # Standard errors from the Jacobian of the curve, scaled by the scatter about the fit
+    n = t.size
+    cov = None
+    if n > k:
+        J = np.empty((n, k))
+        for j in range(k):
+            h = 1e-6 * max(abs(p[j]), 1e-12)
+            pp, pm = p.copy(), p.copy()
+            pp[j] += h
+            pm[j] -= h
+            J[:, j] = (fit_model_value(model, pp, t) - fit_model_value(model, pm, t)) / (2 * h)
+        Jw = J * sw[:, None]
+        try:
+            cov = np.linalg.inv(Jw.T.dot(Jw)) * (chi2 / (n - k))
+        except np.linalg.LinAlgError:
+            cov = None
+
+    def err(grad):
+        if cov is None:
+            return None
+        v = float(np.dot(grad, cov.dot(grad)))
+        return math.sqrt(v) if v >= 0 and np.isfinite(v) else None
+
+    def unit(j):
+        e = np.zeros(k)
+        e[j] = 1.0
+        return e
+    par = OrderedDict()
+    notes = []
+    if model == "biexp":
+        s_inf = p[0] + p[2]
+        par["S_inf"] = (s_inf, err(np.array([1.0, 0.0, 1.0, 0.0])))
+        par["T_1"] = (p[1], err(unit(1)))
+        par["T_2"] = (p[3], err(unit(3)))
+        if s_inf != 0:
+            g1 = np.array([p[2] / s_inf ** 2, 0.0, -p[0] / s_inf ** 2, 0.0])
+            par["f_1"] = (p[0] / s_inf, err(g1))
+        if p[0] * p[2] < 0:
+            notes.append("components of opposite sign")
+        times = [p[1], p[3]]
+    else:
+        par["S_inf"] = (p[0], err(unit(0)))
+        if model == "offset":
+            par["S_0"] = (p[1], err(unit(1)))
+        it = 2 if model == "offset" else 1
+        par["T_B"] = (p[it], err(unit(it)))
+        if model == "stretched":
+            par["beta"] = (p[2], err(unit(2)))
+            if p[2] <= 0.101 or p[2] >= 2.99:
+                notes.append("beta at the limit of the search (0.1 to 3)")
+        times = [p[it]]
+    # A time at the edge of the search is not determined by the data (e.g. a series that
+    # still rises linearly, or one already at its plateau)
+    why = None
+    if max(times) >= tmax * 29.0:
+        why = "T_B beyond 30 times the longest D1 (the curve has not bent yet)"
+    elif min(times) <= tmin / 29.0:
+        why = "T_B below 1/30 of the shortest D1 (no rise sampled)"
+    t_long, t_short = ("T_2", "T_1") if model == "biexp" else ("T_B", "T_B")
+    if why is None and tmax < 3.0 * max(times):
+        notes.append("longest D1 = %.2g %s: S_inf extrapolated" % (tmax / max(times), t_long))
+    if why is None and tmin > 0.5 * min(times):
+        notes.append("shortest D1 = %.2g %s: rise hardly sampled" % (tmin / min(times), t_short))
+
+    # Largest signal per square root of time, from the build-up part of the curve
+    if model == "mono":
+        t_opt = SENS_X * p[1]
+        s_opt = abs(p[0]) * -math.expm1(-SENS_X) / math.sqrt(t_opt)
+    else:
+        tt = np.exp(np.linspace(math.log(min(times) / 1000.0), math.log(max(times) * 100.0), 4001))
+        g = np.abs(fit_model_value(model, p, tt) - fit_model_value(model, p, [0.0])[0]) / np.sqrt(tt)
+        i = int(np.argmax(g))
+        lo_t, hi_t = tt[max(0, i - 1)], tt[min(tt.size - 1, i + 1)]
+        tt = np.linspace(lo_t, hi_t, 2001)
+        g = np.abs(fit_model_value(model, p, tt) - fit_model_value(model, p, [0.0])[0]) / np.sqrt(tt)
+        i = int(np.argmax(g))
+        t_opt, s_opt = float(tt[i]), float(g[i])
+    return {"model": model, "p": p, "params": par, "n": n, "chi2_red": chi2 / (n - k) if n > k else None,
+            "s_inf": par["S_inf"][0], "times": times, "t_opt": t_opt, "s_opt": s_opt,
+            "notes": notes, "tmin": tmin, "tmax": tmax, "determined": why is None, "why": why}
+
+
+def fmt_pm(v, e):
+    """v ± e with e to two significant digits (v alone without e)."""
+    if e is None or not np.isfinite(e) or e <= 0:
+        return "%.3g" % v
+    if v != 0 and e < 1e-5 * abs(v):                 # e.g. data without noise
+        return "%.5g ± %.1g" % (v, e)
+    if abs(v) >= 1e5 or abs(v) < 1e-3 or e >= 1e5:
+        return "%.3g ± %.2g" % (v, e)
+    d = max(0, 1 - int(math.floor(math.log10(e))))
+    return "%.*f ± %.*f" % (d, v, d, e)
+
+
+def fmt_time(v, e=None):
+    """A time in s, ± e, with minutes added from 2 min."""
+    s = fmt_pm(v, e) + " s"
+    if v >= 120:
+        s += " (%.3g min)" % (v / 60.0)
+    return s
+
+
+def fit_summary(f, ascii_only=False):
+    """One line: the fitted parameters and the largest S/sqrt(t)."""
+    pm = (lambda v, e: fmt_pm(v, e).replace("±", "+/-")) if ascii_only else fmt_pm
+    tm = (lambda v, e=None: fmt_time(v, e).replace("±", "+/-")) if ascii_only else fmt_time
+    names = {"S_inf": "S_inf" if ascii_only else "S∞", "S_0": "S_0" if ascii_only else "S₀",
+             "T_B": "T_B", "T_1": "T_1" if ascii_only else "T₁", "T_2": "T_2" if ascii_only else "T₂",
+             "beta": "beta" if ascii_only else "β", "f_1": "f_1" if ascii_only else "f₁"}
+    parts = []
+    for k, (v, e) in f["params"].items():
+        parts.append("%s %s" % (names[k], tm(v, e) if k.startswith("T_") else pm(v, e)))
+    if f["model"] == "mono":
+        parts.append("max S/%s %.4g at D1 = 1.26 T_B = %s"
+                     % ("sqrt(t)" if ascii_only else "√t", f["s_opt"], tm(f["t_opt"])))
+    else:
+        parts.append("max S/%s %.4g at D1 = %s" % ("sqrt(t)" if ascii_only else "√t", f["s_opt"], tm(f["t_opt"])))
+    return ("; " if ascii_only else " · ").join(parts)
+
+
+def ui_text(text):
+    """Notes and parameter names for the window (S_inf -> S∞ etc.)."""
+    for a, b in (("S_inf", "S∞"), ("T_1", "T₁"), ("T_2", "T₂"), ("beta", "β"), ("sqrt(t)", "√t")):
+        text = text.replace(a, b)
+    return text
+
+
+def fit_summary_ui(f):
+    """Short form for the window: the build-up time(s) first, then S∞, the other parameters
+    and the largest S/√t; or why the fit is not determined."""
+    if not f["determined"]:
+        return ui_text("not determined: " + f["why"])
+    P = f["params"]
+    first = [k for k in ("T_B", "T_1", "T_2") if k in P]
+    parts = ["%s %s" % (ui_text(k), fmt_time(*P[k])) for k in first]
+    parts += ["%s %s" % (ui_text(k).replace("S_0", "S₀").replace("f_1", "f₁"), fmt_pm(*P[k]))
+              for k in P if k not in first]
+    at = fmt_time(f["t_opt"]) + (" (1.26 T_B)" if f["model"] == "mono" else "")
+    parts.append("max S/√t %.4g at %s" % (f["s_opt"], at))
+    return " · ".join(parts)
+
+
+
+def buildup_series(results):
+    """{(kind, set): records with a value and a D1, sorted by D1}, ON before OFF."""
+    out = OrderedDict()
+    for kind in ("ON", "OFF"):
+        for s in sorted(set(r["set"] for r in results)):
+            pts = sorted([r for r in results if r["kind"] == kind and r["set"] == s
+                          and r["y"] is not None and r["d1"] is not None], key=lambda r: r["d1"])
+            if pts:
+                out[(kind, s)] = pts
+    return out
+
+
+def buildup_fits(results, model):
+    """{(kind, set): fit_buildup result, or {"error": text}} for each series."""
+    fits = OrderedDict()
+    for key, pts in buildup_series(results).items():
+        try:
+            fits[key] = fit_buildup([r["d1"] for r in pts], [r["y"] for r in pts],
+                                    [r["ns"] if r["ns"] else r["ns_run"] for r in pts], model)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError, OverflowError) as ex:
+            fits[key] = {"error": str(ex)}
+    return fits
+
+
+def planned_records(runpath):
+    """[(expno, expected s)] of a build-up from settings.txt in the run folder, or None."""
+    if not is_run_folder_layout(runpath):
+        return None
+    out = []
+    try:
+        with open(os.path.join(os.path.dirname(runpath), "settings.txt")) as fh:
+            for line in fh:
+                m = re.match(r"#\s*record:\s*(\d+)\s+\d+\s+\w+\s+\S+\s+\d+\s+(\d+)", line)
+                if m:
+                    out.append((int(m.group(1)), int(m.group(2))))
+    except Exception:
+        return None
+    return out or None
 
 
 # --------------------------------------------------------------------------
@@ -790,9 +1170,10 @@ class Analyzer:
         return False
 
     def set_display(self, **flags):
-        """Sets display-only settings (show_integral, show_fid_phase) and saves them.
-        Returns an error text or ''."""
-        self.phase = dict(self.phase, **dict((k, bool(v)) for k, v in flags.items()))
+        """Sets display-only settings (show_integral, show_fid_phase; for build-ups fit_model,
+        log_d1, normalize) and saves them. Returns an error text or ''."""
+        self.phase = dict(self.phase, **dict((k, v if isinstance(v, str) else bool(v))
+                                             for k, v in flags.items()))
         try:
             write_phase_file(self.phase_path, self.phase, self.runpath)
             self.phase_mtime = os.path.getmtime(self.phase_path)
@@ -916,6 +1297,7 @@ class Analyzer:
         elif ph["win_set"]:
             center, width, mode = ph["center"], ph["width"], ph["mode"]
         skey = proc_key(ph)
+        buildup = meta.get("type") == "buildup"
         fid_mode = mode == FID_MODE
         need_fid = force_fid or fid_mode or bool(ph.get("show_fid_phase"))
 
@@ -946,6 +1328,8 @@ class Analyzer:
         if need_fid:
             on_ph = [r["fid"]["phase"] for r in results
                      if r["kind"] == "ON" and r["fid"]["phase"] is not None]
+            if buildup and not on_ph:            # a build-up of OFF records only
+                on_ph = [r["fid"]["phase"] for r in results if r["fid"]["phase"] is not None]
             if on_ph:
                 fid_ref = phase_reference(on_ph)
                 for r in results:
@@ -987,6 +1371,13 @@ class Analyzer:
                 r["note"] = (r["note"] + "; " if r["note"] else "") + \
                     "no usable start OFF in set %d" % r["set"]
 
+        fits = OrderedDict()
+        if buildup:                              # ON and OFF are both series, against D1
+            for r in results:
+                r["y"] = r["value"] if r["d1"] is not None else None
+                r["yi"] = None
+            fits = buildup_fits(results, ph.get("fit_model", "mono"))
+
         latest = None
         readable = [r for r in results if r["readable"]]
         if readable:
@@ -1001,11 +1392,14 @@ class Analyzer:
                 "width": width, "mode": mode, "off_mode": off_mode, "use_enh": use_enh,
                 "starts": valid, "latest": latest, "phase": dict(ph), "ds_dir": ds_dir,
                 "multi_set": len(set(r["set"] for r in results)) > 1,
-                "show_integral": bool(ph.get("show_integral")) and mode != "sum",
+                "show_integral": bool(ph.get("show_integral")) and mode != "sum" and not buildup,
                 "n_phase_skipped": len([q for q in results if q["phase_skipped"]]),
                 "fid_mode": fid_mode, "fid_n": int(ph["fid_n"]), "fid_fit": bool(ph["fid_fit"]),
                 "show_fid_phase": bool(ph.get("show_fid_phase")), "need_fid": need_fid,
-                "fid_ref": fid_ref, "latest_fid": latest_fid, "plan": run_plan(self.runpath)}
+                "fid_ref": fid_ref, "latest_fid": latest_fid, "plan": run_plan(self.runpath),
+                "buildup": buildup, "fits": fits, "fit_model": ph.get("fit_model", "mono"),
+                "log_d1": bool(ph.get("log_d1")), "normalize": bool(ph.get("normalize")),
+                "planned": planned_records(self.runpath) if buildup else None}
 
     # -- CSV ----------------------------------------------------------------------
     def window_integrals(self, ds_dir, r, ph, center, width):
@@ -1080,6 +1474,10 @@ class Analyzer:
         cols = ["expno", "set", "kind", "label", "freq_GHz", "acq_time", "acq_epoch_s", "ns", "rg",
                 "grpdly", "fid_t0_mean_per_ns_rg", "fid_t0_fit_per_ns_rg", "fid_phase_deg",
                 "fid_phase_abs_deg", "real_integral_per_scan", "magnitude_integral_per_scan", "note"]
+        if a.get("buildup"):                     # D1 after the frequency
+            cols.insert(5, "d1_s")
+            for row, r in zip(rows, a["results"]):
+                row.insert(5, "" if r["d1"] is None else "%g" % r["d1"])
         tmp = path + ".tmp"
         with open(tmp, "w", newline="") as fh:
             for h in head:
@@ -1118,8 +1516,11 @@ def fid_status(a):
                else "mean |fid[g..g+%d]|" % (n - 1))
         lines.append("FID(t0): %s / (NS*RG); %s" % (how, gtxt))
     if a["show_fid_phase"]:
-        lines.append("FID phase (lower panel): arg(mean fid[g..g+%d]) relative to the median of the ON "
-                     "records%s" % (n - 1, "" if a["fid_mode"] else "; " + gtxt))
+        ref = "the ON records"
+        if a.get("buildup") and not any(r["kind"] == "ON" for r in res):
+            ref = "the records"
+        lines.append("FID phase (lower panel): arg(mean fid[g..g+%d]) relative to the median of %s%s"
+                     % (n - 1, ref, "" if a["fid_mode"] else "; " + gtxt))
     bad = OrderedDict()                  # reason -> expnos without a usable GRPDLY
     for r in res:
         if r["fid"] and r["fid"]["read"] and r["fid"]["g"] is None:
@@ -1213,14 +1614,23 @@ def run_state(a, now=None):
         return {"kind": "stopped", "title": "Stopped before the end",
                 "detail": " · ".join([ended[len("stopped: "):] if ended.startswith("stopped: ") else ended]
                                      + parts)}
+    planned = a.get("planned")                 # build-up: expected duration of each record
+    if planned and last is not None:
+        todo = [e for x, e in planned if x > last]
+    else:
+        todo = None
     if times:
         quiet = now - times[-1]
         limit = max(4 * step, 600) if step else 3600      # s without a new record
+        if todo:                               # records differ in length: the next one is overdue
+            limit = max(2 * todo[0], todo[0] + 600)
         if quiet > limit:
             return {"kind": "stale", "title": "No new record for %d min" % (quiet // 60),
                     "detail": " · ".join(parts + ["last record %s" % clock(times[-1], now),
                                                   "the run file has no end line: check TopSpin"])}
-        if step and total is not None and done < total:
+        if todo:
+            parts.append("ends ≈ %s" % clock(times[-1] + sum(todo), now))
+        elif step and total is not None and done < total and todo is None:
             parts.append("ends ≈ %s" % clock(times[-1] + (total - done) * step, now))
         parts.append("last record %s" % clock(times[-1], now))
     return {"kind": "running", "title": "Experiment running", "detail": " · ".join(parts)}
@@ -1283,7 +1693,113 @@ def profile_info(a, runpath):
     return rows
 
 
+def series_name(key, multi):
+    kind, s = key
+    return ("%s set %d" % (kind, s)) if multi else kind
+
+
+def fit_ratios(a):
+    """[(set, S_inf ratio, max S/sqrt(t) ratio)] for the sets with both ON and OFF fitted."""
+    out = []
+    fits = a["fits"]
+    for (kind, s), f in fits.items():
+        g = fits.get(("OFF", s))
+        if kind != "ON" or g is None or "error" in f or "error" in g \
+                or not (f["determined"] and g["determined"]):
+            continue
+        r1 = f["s_inf"] / g["s_inf"] if g["s_inf"] else None
+        r2 = f["s_opt"] / g["s_opt"] if g["s_opt"] else None
+        out.append((s, r1, r2))
+    return out
+
+
+def buildup_info(a, runpath):
+    """Rows (key, text, warn) for a build-up run, for the window: run, measure and fit model,
+    one row per fitted series, the ON/OFF ratios, and notes and warnings."""
+    rows = profile_info(a, runpath)[:1]          # Run
+    model = a["fit_model"]
+    if a["fid_mode"]:
+        meas = [mode_label(a["mode"], a), grpdly_text(a["results"]), "per NS·RG"]
+    else:
+        proc = spectrum_status(a)
+        meas = [window_text(a).replace("+/-", "±"), a["mode"],
+                "; ".join(proc) if proc else "spectra as processed by TopSpin"]
+    meas.append("fit: %s %s, weighted by NS, ± 1 standard error" % (FIT_MODELS[model], FIT_FORMULAS_UI[model]))
+    rows.append(("Measure", " · ".join(meas), False))
+    multi = a["multi_set"]
+    notes = []
+    for key, f in a["fits"].items():
+        name = series_name(key, multi)
+        if "error" in f:
+            rows.append((name, "no fit: %s" % f["error"], True))
+            continue
+        rows.append((name, fit_summary_ui(f), not f["determined"]))
+        notes += ["%s %s" % (name, ui_text(n)) for n in f["notes"]]
+    for s, r1, r2 in fit_ratios(a):
+        txt = []
+        if r1 is not None:
+            txt.append("S∞ %.4g" % r1)
+        if r2 is not None:
+            txt.append("max S/√t %.4g" % r2)
+        rows.append(("ON/OFF" if not multi else "ON/OFF %d" % s, " · ".join(txt), False))
+    if not a["fits"]:
+        rows.append(("", "waiting for the first record", False))
+    if notes:
+        rows.append(("Note", "; ".join(notes), True))
+    for line in fid_status(a):
+        if line.startswith("WARNING: "):
+            rows.append(("Warning", line[len("WARNING: "):], True))
+    bad = [r for r in a["results"] if r["value"] is None
+           and not (a["fid_mode"] and r["fid"]["read"] and r["fid"]["g"] is None)]
+    for r in bad[-3:]:
+        rows.append(("Warning", "expno %d: %s" % (r["expno"], r["note"]), True))
+    return rows
+
+
+def write_buildup_tsv(path, a):
+    """values.tsv of a build-up: one row per record, with D1 and the fitted value; the fits in
+    the header."""
+    if a["fid_mode"]:
+        what = "mode %s (intensity_per_scan = FID(t0) / (NS*RG))" % mode_label(a["mode"], a)
+    else:
+        what = "%s, mode %s" % (window_text(a), a["mode"])
+    fits = a["fits"]
+    with open(path, "w") as fh:
+        fh.write("# build-up; %s; y = %s against D1\n"
+                 % (what, "FID(t0) per NS*RG" if a["fid_mode"] else "intensity per scan"))
+        st = phase_status(a)
+        fh.write("# %s\n" % ("; ".join(st) if st else "phase: as processed by TopSpin"))
+        fh.write("# fit: %s, %s; least squares weighted by NS; +/- one standard error\n"
+                 % (FIT_MODELS[a["fit_model"]], FIT_FORMULAS[a["fit_model"]]))
+        for key, f in fits.items():
+            name = series_name(key, a["multi_set"])
+            if "error" in f:
+                fh.write("# %s: no fit: %s\n" % (name, f["error"]))
+            else:
+                notes = f["notes"] + ([] if f["determined"] else ["not determined: " + f["why"]])
+                fh.write("# %s: %s%s\n" % (name, fit_summary(f, ascii_only=True),
+                                          "".join("; NOTE: " + n for n in notes)))
+        for s, r1, r2 in fit_ratios(a):
+            fh.write("# ON/OFF%s: S_inf ratio %s; max S/sqrt(t) ratio %s\n"
+                     % (" set %d" % s if a["multi_set"] else "",
+                        "-" if r1 is None else "%.4g" % r1, "-" if r2 is None else "%.4g" % r2))
+        fh.write("expno\tkind\tlabel\tset\td1_s\tns\tintensity_per_scan\tppm_of_point\tfit_per_scan\tnote\n")
+        for r in a["results"]:
+            f = fits.get((r["kind"], r["set"]))
+            fv = ""
+            if f is not None and "error" not in f and r["d1"] is not None:
+                fv = "%.6g" % fit_model_value(f["model"], f["p"], [r["d1"]])[0]
+            fh.write("%d\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n" % (
+                r["expno"], r["kind"], r["label"], r["set"],
+                "" if r["d1"] is None else "%g" % r["d1"],
+                r["ns"] if r["ns"] is not None else r["ns_run"],
+                "" if r["value"] is None else "%.6g" % r["value"],
+                "" if r["at"] is None else "%.2f" % r["at"], fv, r["note"]))
+
+
 def write_tsv(path, a):
+    if a.get("buildup"):
+        return write_buildup_tsv(path, a)
     if a["fid_mode"]:
         what = "mode %s (intensity_per_scan = FID(t0) / (NS*RG)); integral columns: %s" % (
             mode_label(a["mode"], a), window_text(a))
@@ -1371,8 +1887,12 @@ class Panels:
 
 
 def record_what(r, multi):
-    """'ON 526.050 GHz' or 'OFF start', with the set if there are several."""
-    what = ("ON %.3f GHz" % r["freq"]) if r["kind"] == "ON" else ("OFF %s" % r["label"])
+    """'ON 526.050 GHz' or 'OFF start' (build-ups: 'ON, D1 30 s'), with the set if there are
+    several."""
+    if r.get("d1") is not None:
+        what = "%s, D1 %g s" % (r["kind"], r["d1"])
+    else:
+        what = ("ON %.3f GHz" % r["freq"]) if r["kind"] == "ON" else ("OFF %s" % r["label"])
     return ("set %d, %s" % (r["set"], what)) if multi else what
 
 
@@ -1445,9 +1965,45 @@ def draw_fid_phase(ax3, a, compact=False):
     ax3.grid(True, color="0.9")
 
 
+def draw_latest(ax2, a):
+    """Right-hand panel of plot.png: the latest spectrum with the window, or the start of
+    the latest FID (ax2 None: nothing)."""
+    fidm, multi = a["fid_mode"], a["multi_set"]
+    lt = a["latest"]
+    if ax2 is None:
+        return
+    elif fidm:
+        draw_fid_start(ax2, a)
+    elif lt is not None:
+        r, ppm, d = lt["row"], lt["ppm"], lt["y"]
+        if a["center"] is None:
+            lo, hi = float(ppm.min()), float(ppm.max())
+            ax2.plot(ppm, d, color="0.15", lw=0.8)
+        else:
+            half = a["width"] / 2.0
+            lo, hi = a["center"] - 4 * half, a["center"] + 4 * half
+            sel = (ppm >= lo) & (ppm <= hi)
+            if np.any(sel):
+                ax2.plot(ppm[sel], d[sel], color="0.15", lw=0.8)
+            ax2.axvspan(a["center"] - half, a["center"] + half, color="#1f5fa8", alpha=0.12)
+        if r["at"] is not None and r["value"] is not None:
+            ax2.plot([r["at"]], [r["value"]], "o", color="#c0392b", ms=6)
+        ax2.set_xlim(hi, lo)
+        ax2.set_title("latest: expno %d, %s" % (r["expno"], record_what(r, multi)), fontsize=9)
+    else:
+        ax2.text(0.5, 0.5, "no spectrum yet", transform=ax2.transAxes,
+                 ha="center", va="center", color="0.4")
+    if not fidm:
+        ax2.set_xlabel("ppm")
+        ax2.set_ylabel("intensity per scan")
+    ax2.axhline(0.0, color="0.8", lw=0.6)
+
+
 def draw(p, a, runpath):
     """p: Panels. ax1b, the twin of ax1 (right-hand axis), takes the integral when
     intensities are plotted."""
+    if a.get("buildup"):
+        return draw_buildup(p, a, runpath)
     p.layout(a["show_fid_phase"])
     ax1, ax2, ax1b, ax3 = p.ax1, p.ax2, p.ax1b, p.ax3
     fig = p.fig
@@ -1579,39 +2135,7 @@ def draw(p, a, runpath):
     if lines and not p.compact:              # the window shows them above the plot instead
         ax1.set_title("\n".join(lines), loc="left", fontsize=8, color="0.25", family="monospace")
 
-    # Latest spectrum with the window, or the start of the latest FID
-    lt = a["latest"]
-    if ax2 is None:
-        pass
-    elif fidm:
-        draw_fid_start(ax2, a)
-    elif lt is not None:
-        r, ppm, d = lt["row"], lt["ppm"], lt["y"]
-        if a["center"] is None:
-            lo, hi = float(ppm.min()), float(ppm.max())
-            ax2.plot(ppm, d, color="0.15", lw=0.8)
-        else:
-            half = a["width"] / 2.0
-            lo, hi = a["center"] - 4 * half, a["center"] + 4 * half
-            sel = (ppm >= lo) & (ppm <= hi)
-            if np.any(sel):
-                ax2.plot(ppm[sel], d[sel], color="0.15", lw=0.8)
-            ax2.axvspan(a["center"] - half, a["center"] + half, color="#1f5fa8", alpha=0.12)
-        if r["at"] is not None and r["value"] is not None:
-            ax2.plot([r["at"]], [r["value"]], "o", color="#c0392b", ms=6)
-        ax2.set_xlim(hi, lo)
-        what = ("ON %.3f GHz" % r["freq"]) if r["kind"] == "ON" else ("OFF %s" % r["label"])
-        if multi:
-            what = "set %d, %s" % (r["set"], what)
-        ax2.set_title("latest: expno %d, %s" % (r["expno"], what), fontsize=9)
-    else:
-        ax2.text(0.5, 0.5, "no spectrum yet", transform=ax2.transAxes,
-                 ha="center", va="center", color="0.4")
-    if ax2 is not None:
-        if not fidm:
-            ax2.set_xlabel("ppm")
-            ax2.set_ylabel("intensity per scan")
-        ax2.axhline(0.0, color="0.8", lw=0.6)
+    draw_latest(ax2, a)
 
     if p.compact:                            # the window: no title either
         p.fit_layout()
@@ -1629,6 +2153,201 @@ def draw(p, a, runpath):
                               len([q for q in res if q["kind"] == "ON"]), len(offs), status),
                            fontsize=9)
     relayout(fig, 0.05 if p.with_text else 0.0, 0.92)    # bottom 5 %: the reopen command
+
+
+OFF_COLORS = ["#d68910", "#8e44ad", "#7f8c8d", "#17a2b8", "#2a9d5c", "#1f5fa8"]
+D1_LABEL = "D1, build-up time (s)"
+
+
+def buildup_style(kind, index):
+    """(color, marker, marker face) of a build-up series: ON filled circles, OFF open squares."""
+    if kind == "ON":
+        c = SET_COLORS[index % len(SET_COLORS)]
+        return c, "o", c
+    return OFF_COLORS[index % len(OFF_COLORS)], "s", "none"
+
+
+def fit_label(f, name, ascii_only=False):
+    """Legend entry of a fitted curve, e.g. 'ON fit, T_B 29.6 s'."""
+    P = f["params"]
+    if f["model"] == "biexp":
+        t = ("T1 %.3g s, T2 %.3g s" if ascii_only else "T₁ %.3g s, T₂ %.3g s") % (P["T_1"][0], P["T_2"][0])
+    else:
+        t = "T_B %.3g s" % P["T_B"][0]
+        if f["model"] == "stretched":
+            t += (", beta %.2f" if ascii_only else ", β %.2f") % P["beta"][0]
+    return ("%s fit, %s" % (name, t)) if name else ("fit, %s" % t)
+
+
+def plot_buildup(ax1, ax1b, a, ascii_only=False, ms=5):
+    """The build-up series of a with their fitted curves, on ax1; OFF on ax1b when ON and
+    OFF are both shown and not normalized. Returns (lines, sep, series, scales)."""
+    series = buildup_series(a["results"])
+    fits, norm, multi = a["fits"], a["normalize"], a["multi_set"]
+    kinds = set(k for k, s in series)
+    sep = len(kinds) == 2 and not norm
+    allpts = [r for pts in series.values() for r in pts]
+    tt = None
+    if allpts:
+        d1 = [r["d1"] for r in allpts]
+        if a["log_d1"]:
+            tt = np.exp(np.linspace(math.log(min(d1) / 2.0), math.log(max(d1) * 1.5), 300))
+        else:
+            tt = np.linspace(0.0, max(d1) * 1.05, 300)
+    lines, scales, count = [], {}, {"ON": 0, "OFF": 0}
+    named = multi or len(kinds) > 1
+    for key, pts in series.items():
+        kind = key[0]
+        col, mk, mfc = buildup_style(kind, count[kind])
+        count[kind] += 1
+        ax = ax1b if (sep and kind == "OFF") else ax1
+        f = fits.get(key)
+        ok = f is not None and "error" not in f
+        scale = 1.0
+        if norm:
+            if not ok or not f["determined"] or not f["s_inf"]:
+                continue                       # nothing to normalize to
+            scale = 1.0 / f["s_inf"]
+        scales[key] = scale
+        name = series_name(key, multi)
+        lines += ax.plot([r["d1"] for r in pts], [r["y"] * scale for r in pts], ls="none", marker=mk,
+                         color=col, mfc=mfc, ms=ms, label=name, zorder=3)
+        if ok:
+            lab = fit_label(f, name if named else None, ascii_only)
+            if not f["determined"]:
+                lab = ("%s fit: not determined" % name) if named else "fit: not determined"
+            lines += ax.plot(tt, fit_model_value(f["model"], f["p"], tt) * scale,
+                             "-" if f["determined"] else "--", color=col, lw=1.1, label=lab, zorder=2)
+    return lines, sep, series, scales
+
+
+def buildup_xlim(ax1, a, series):
+    """Linear D1 axis from 0, or a log axis around the D1 values."""
+    d1 = [r["d1"] for pts in series.values() for r in pts]
+    if a["log_d1"] and d1:
+        ax1.set_xscale("log")
+        ax1.set_xlim(min(d1) / 2.2, max(d1) * 1.6)
+        # 0.1, 1, 10 rather than powers of ten (mathtext, which is not text in the EPS)
+        ax1.xaxis.set_major_formatter(FuncFormatter(lambda v, pos: "%g" % v))
+    elif d1:
+        ax1.set_xlim(0.0, max(d1) * 1.07)
+
+
+def buildup_ylabels(ax1, ax1b, a, series, sep, ascii_only=False):
+    unit = "FID(t0) / (NS*RG)" if a["fid_mode"] else "intensity per scan"
+    if a["normalize"]:
+        ax1.set_ylabel("S / S_inf (fitted)" if ascii_only else "S / S∞ (fitted)")
+    elif sep:
+        ax1.set_ylabel("ON: " + unit, color=SET_COLORS[0])
+        ax1b.set_ylabel("OFF: " + unit, color=OFF_COLORS[0])
+    else:
+        kinds = sorted(set(k for k, s in series))
+        ax1.set_ylabel(unit + (" (%s)" % kinds[0] if len(kinds) == 1 else ""))
+
+
+def draw_buildup(p, a, runpath):
+    """The build-up: intensity against D1 with the fits (ax1, OFF on ax1b if separate), the
+    FID phase below it if shown (ax3), and for plot.png the latest spectrum (ax2)."""
+    p.layout(a["show_fid_phase"])
+    ax1, ax2, ax1b, ax3 = p.ax1, p.ax2, p.ax1b, p.ax3
+    fig = p.fig
+    if ax1.get_xscale() != "linear":          # a log axis would warn about the limits of clear()
+        ax1.set_xscale("linear")
+    ax1.clear()
+    if ax2 is not None:
+        ax2.clear()
+    ax1b.clear()
+    ax1b.yaxis.tick_right()                    # clear() puts the twin's ticks and label on the left
+    ax1b.yaxis.set_label_position("right")
+    ax1b.set_visible(False)
+    if ax3 is not None:
+        ax3.clear()
+    res, multi = a["results"], a["multi_set"]
+    lines, sep, series, scales = plot_buildup(ax1, ax1b, a)
+    allpts = [r for key, pts in series.items() if key in scales for r in pts]
+    if allpts:
+        if sep:
+            ax1b.set_visible(True)
+        r = max(allpts, key=lambda q: q["expno"])
+        ax = ax1b if (sep and r["kind"] == "OFF") else ax1
+        ax.plot([r["d1"]], [r["y"] * scales[(r["kind"], r["set"])]], "o", color="#c0392b", ms=8,
+                mfc="none", mew=1.8, zorder=4)
+        h, l = ax1.get_legend_handles_labels()
+        if sep:
+            h2, l2 = ax1b.get_legend_handles_labels()
+            h, l = h + h2, l + l2
+        ax1.legend(h, l, fontsize=8, loc="best")
+    else:
+        ax1.text(0.5, 0.5, "waiting for the first record" if not series else
+                 "no fit to normalize to (see the lines above)", transform=ax1.transAxes,
+                 ha="center", va="center", color="0.4")
+    buildup_ylabels(ax1, ax1b, a, series, sep)
+    ax1.axhline(0.0, color="0.6", lw=0.8)
+    buildup_xlim(ax1, a, series)
+    if ax3 is not None:
+        on = [r for r in res if r["d1"] is not None and r["fid"] and r["fid"]["phase_rel"] is not None]
+        count = {"ON": 0, "OFF": 0}
+        for key in [k for k in buildup_series(res)] or []:
+            pts = sorted([r for r in on if (r["kind"], r["set"]) == key], key=lambda q: q["d1"])
+            col, mk, mfc = buildup_style(key[0], count[key[0]])
+            count[key[0]] += 1
+            if pts:
+                ax3.plot([r["d1"] for r in pts], [r["fid"]["phase_rel"] for r in pts], ls="none",
+                         marker=mk, color=col, mfc=mfc, ms=4)
+        if on:
+            r = max(on, key=lambda q: q["expno"])
+            ax3.plot([r["d1"]], [r["fid"]["phase_rel"]], "o", color="#c0392b", ms=7, mfc="none", mew=1.5)
+        else:
+            ax3.text(0.5, 0.5, "no FID phase (see the lines above the plot)", transform=ax3.transAxes,
+                     ha="center", va="center", color="0.4")
+        ax3.axhline(0.0, color="0.6", lw=0.8)
+        if p.compact:
+            ax3.set_title("FID phase (deg), relative to the median of the ON records", loc="left", fontsize=8)
+        else:
+            ax3.set_ylabel("FID phase (deg)", fontsize=9)
+        ax3.set_xlabel(D1_LABEL)
+        ax3.grid(True, color="0.9")
+        ax1.tick_params(labelbottom=False)
+        fig.align_ylabels([ax1, ax3])
+    else:
+        ax1.set_xlabel(D1_LABEL)
+    ax1.grid(True, color="0.9")
+
+    if p.compact:                            # the window: fit results above the plot, no title
+        p.fit_layout()
+        return
+    lines = ["fit: %s, %s (weighted by NS; +/- one standard error)"
+             % (FIT_MODELS[a["fit_model"]], FIT_FORMULAS[a["fit_model"]])]
+    for key, f in a["fits"].items():
+        name = series_name(key, multi)
+        lines.append("%s: %s" % (name, ("no fit: " + f["error"]) if "error" in f
+                                 else fit_summary(f, ascii_only=True)))
+        if "error" not in f:
+            lines += ["%s: NOTE: %s" % (name, n) for n in
+                      f["notes"] + ([] if f["determined"] else ["not determined: " + f["why"]])]
+    for s, r1, r2 in fit_ratios(a):
+        lines.append("ON/OFF%s: S_inf ratio %s; max S/sqrt(t) ratio %s"
+                     % (" set %d" % s if multi else "", "-" if r1 is None else "%.4g" % r1,
+                        "-" if r2 is None else "%.4g" % r2))
+    lines.extend(phase_status(a))
+    bad = [r for r in res if r["value"] is None
+           and not (a["fid_mode"] and r["fid"]["read"] and r["fid"]["g"] is None)]
+    for r in bad[-3:]:
+        lines.append("expno %d: %s" % (r["expno"], r["note"]))
+    ax1.set_title("\n".join(lines), loc="left", fontsize=8, color="0.25", family="monospace")
+    draw_latest(ax2, a)
+    meta = a["meta"]
+    status = "running" if a["ended"] is None else a["ended"]
+    if a["fid_mode"]:
+        what = mode_label(a["mode"], a)
+    else:
+        what = "%s, %s" % (window_text(a), a["mode"])
+    fig.suptitle("%s  |  %s  |  %s\n%s  |  build-up, %s  |  %d ON, %d OFF  |  %s"
+                 % (meta.get("sample", ""), meta.get("conditions", ""),
+                    os.path.basename(meta.get("dataset_dir", "")) or os.path.dirname(runpath),
+                    run_label(runpath), what, len([q for q in res if q["kind"] == "ON"]),
+                    len([q for q in res if q["kind"] == "OFF"]), status), fontsize=9)
+    relayout(fig, 0.05 if p.with_text else 0.0, 0.92)
 
 
 EPS_RC = {
@@ -1692,6 +2411,8 @@ def write_profile_eps(path, a, aspect=None):
     marker its own path; the data are not clipped to the axes (no clipping masks); the
     text is Helvetica text. The axes span the whole profile. Width EPS_WIDTH; height
     EPS_WIDTH * aspect (height/width of the profile in the window), 2 to 5 in."""
+    if a.get("buildup"):
+        return write_buildup_eps(path, a, aspect)
     from matplotlib.backends.backend_ps import FigureCanvasPS
     on = [r for r in a["results"] if r["kind"] == "ON" and r["y"] is not None and r["freq"] is not None]
     if not on:
@@ -1757,6 +2478,68 @@ def write_profile_eps(path, a, aspect=None):
     with open(tmp, "w", encoding="latin-1") as fh:
         fh.write(eps_for_illustrator(ps))
     os.replace(tmp, path)
+
+
+def save_eps_for_illustrator(fig, path):
+    tmp = path + ".tmp"
+    fig.savefig(tmp, format="eps")
+    with open(tmp, encoding="latin-1") as fh:
+        ps = fh.read()
+    with open(tmp, "w", encoding="latin-1") as fh:
+        fh.write(eps_for_illustrator(ps))
+    os.replace(tmp, path)
+
+
+def write_buildup_eps(path, a, aspect=None):
+    """The build-up as shown (data, fitted curves, the FID phase if shown, OFF on its own axis
+    or normalized, linear or log D1), for Adobe Illustrator as write_profile_eps: Helvetica
+    text, one path per curve and per marker, nothing clipped; EPS_WIDTH wide."""
+    from matplotlib.backends.backend_ps import FigureCanvasPS
+    if not buildup_series(a["results"]):
+        raise ValueError("no record with a value yet")
+    pts = [r for r in a["results"] if r["d1"] is not None and r["fid"] and r["fid"]["phase_rel"] is not None]
+    with_ph = a["show_fid_phase"] and bool(pts)
+    with matplotlib.rc_context(EPS_RC):
+        h = min(5.0, max(2.0, EPS_WIDTH * aspect)) if aspect else (4.4 if with_ph else 3.2)
+        fig = Figure(figsize=(EPS_WIDTH, h))
+        FigureCanvasPS(fig)
+        if with_ph:
+            gs = fig.add_gridspec(2, 1, height_ratios=[2.6, 1])
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax3 = fig.add_subplot(gs[1, 0], sharex=ax1)
+        else:
+            ax1, ax3 = fig.add_subplot(111), None
+        ax1b = ax1.twinx()
+        lines, sep, series, scales = plot_buildup(ax1, ax1b, a, ascii_only=True, ms=4)
+        if not sep:
+            fig.delaxes(ax1b)
+        buildup_ylabels(ax1, ax1b, a, series, sep, ascii_only=True)
+        lines.append(ax1.axhline(0.0, color="0.6", lw=0.6, zorder=0))
+        h_, l_ = ax1.get_legend_handles_labels()
+        if sep:
+            h2, l2 = ax1b.get_legend_handles_labels()
+            h_, l_ = h_ + h2, l_ + l2
+        ax1.legend(h_, l_, fontsize=8, frameon=False, loc="best")
+        buildup_xlim(ax1, a, series)
+        if ax3 is not None:
+            count = {"ON": 0, "OFF": 0}
+            for key in series:
+                col, mk, mfc = buildup_style(key[0], count[key[0]])
+                count[key[0]] += 1
+                pp = sorted([r for r in pts if (r["kind"], r["set"]) == key], key=lambda q: q["d1"])
+                if pp:
+                    lines += ax3.plot([r["d1"] for r in pp], [r["fid"]["phase_rel"] for r in pp], ls="none",
+                                      marker=mk, color=col, mfc=mfc, ms=3)
+            lines.append(ax3.axhline(0.0, color="0.6", lw=0.6, zorder=0))
+            ax3.set_ylabel("FID phase (deg)")
+            ax3.set_xlabel(D1_LABEL)
+            ax1.tick_params(labelbottom=False)
+        else:
+            ax1.set_xlabel(D1_LABEL)
+        for ln in lines:
+            ln.set_clip_on(False)
+        fig.tight_layout()
+        save_eps_for_illustrator(fig, path)
 
 
 def relayout(fig, bottom=0.0, top=1.0):
@@ -1837,7 +2620,9 @@ def record_label(r, multi):
     s = "%d   " % r["expno"]
     if multi:
         s += "set %d   " % r["set"]
-    if r["kind"] == "ON" and r["freq"] is not None:
+    if r.get("d1") is not None:
+        s += "%s  D1 %g s" % (r["kind"], r["d1"])
+    elif r["kind"] == "ON" and r["freq"] is not None:
         s += "ON %.3f GHz" % r["freq"]
     else:
         s += "%s %s" % (r["kind"], r["label"])
@@ -1959,6 +2744,10 @@ class MainWindow:
         self.updated = None             # time of the last refresh
         self.blink_on = True
 
+        try:
+            self.buildup = read_run(runpath)[0].get("type") == "buildup"
+        except Exception:
+            self.buildup = False
         self.root = tk.Tk()
         self.root.title("fs_plot - %s  |  %s" % (run_label(runpath), reopen))
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -1981,14 +2770,29 @@ class MainWindow:
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Label(bar, text="Also plot:").pack(side=tk.LEFT)
         self.int_var = tk.IntVar(value=0)
-        ttk.Checkbutton(bar, text="window integral", variable=self.int_var,
-                        command=self.on_integral).pack(side=tk.LEFT, padx=(6, 0))
+        if not self.buildup:                     # build-ups: the integral is not plotted
+            ttk.Checkbutton(bar, text="window integral", variable=self.int_var,
+                            command=self.on_integral).pack(side=tk.LEFT, padx=(6, 0))
         self.fph_var = tk.IntVar(value=0)
         ttk.Checkbutton(bar, text="FID phase", variable=self.fph_var,
-                        command=self.on_fid_phase).pack(side=tk.LEFT, padx=(10, 0))
+                        command=self.on_fid_phase).pack(side=tk.LEFT, padx=(10 if not self.buildup else 6, 0))
+        if self.buildup:                         # fit model and axes of the build-up
+            ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
+            ttk.Label(bar, text="Fit:").pack(side=tk.LEFT)
+            self.fit_combo = ttk.Combobox(bar, state="readonly", width=24, values=list(FIT_MODELS.values()))
+            self.fit_combo.pack(side=tk.LEFT, padx=(6, 0))
+            self.fit_combo.current(0)
+            self.fit_combo.bind("<<ComboboxSelected>>", self.on_fit_model)
+            self.logd1_var = tk.IntVar(value=0)
+            ttk.Checkbutton(bar, text="log D1", variable=self.logd1_var,
+                            command=self.on_buildup_axes).pack(side=tk.LEFT, padx=(8, 0))
+            self.norm_var = tk.IntVar(value=0)
+            ttk.Checkbutton(bar, text="normalized", variable=self.norm_var,
+                            command=self.on_buildup_axes).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Label(bar, text="Export:").pack(side=tk.LEFT)
-        ttk.Button(bar, text="Profile EPS", command=self.save_eps).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(bar, text="Build-up EPS" if self.buildup else "Profile EPS",
+                   command=self.save_eps).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="CSV", width=5, command=self.export_csv).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         self.spec_btn = ttk.Button(bar, text="Hide spectrum", width=13, command=self.toggle_spectrum)
@@ -2167,11 +2971,16 @@ class MainWindow:
                 if self.p.show_phase != layout:
                     self.toolbar.update()          # new axes: clear the zoom history
                 self.canvas.draw_idle()
-                self.info.set(profile_info(a, self.runpath))
+                self.info.set(buildup_info(a, self.runpath) if a["buildup"] else profile_info(a, self.runpath))
                 self.last_sig = sig
             self.update_records(a)
             self.int_var.set(1 if self.analyzer.phase.get("show_integral") else 0)
             self.fph_var.set(1 if self.analyzer.phase.get("show_fid_phase") else 0)
+            if self.buildup:
+                ph = self.analyzer.phase
+                self.fit_combo.current(list(FIT_MODELS).index(ph.get("fit_model", "mono")))
+                self.logd1_var.set(1 if ph.get("log_d1") else 0)
+                self.norm_var.set(1 if ph.get("normalize") else 0)
             self.spec.sync(a, phase_changed == "proc", self.selected_row())
             # Live: off from the start for a run that has ended; off when the run ends
             if a["ended"] is None:
@@ -2280,6 +3089,8 @@ class MainWindow:
         a, p = self.last_a, self.p
         if a is None or event.button != 1 or getattr(self.toolbar, "mode", "") != "":
             return
+        if a["buildup"]:
+            return self.on_click_buildup(event)
         if event.inaxes in (p.ax1, p.ax1b):
             targets = [(p.ax1, "y")]
             if a["show_integral"]:
@@ -2308,18 +3119,58 @@ class MainWindow:
         self.set_msg(self.analyzer.set_display(show_integral=bool(self.int_var.get())))
         self.refresh(reschedule=False)
 
+    def on_click_buildup(self, event):
+        """Left click near a point of the build-up (or of the FID phase): shows that record."""
+        a, p = self.last_a, self.p
+        if event.inaxes not in (p.ax1, p.ax1b) and not (p.ax3 is not None and event.inaxes is p.ax3):
+            return
+        series = buildup_series(a["results"])
+        sep = len(set(k for k, s in series)) == 2 and not a["normalize"]
+        best, dmin = None, 30.0                # pixels
+        for key, pts in series.items():
+            f = a["fits"].get(key)
+            scale = 1.0
+            if a["normalize"]:
+                if f is None or "error" in f or not f["s_inf"]:
+                    continue
+                scale = 1.0 / f["s_inf"]
+            for r in pts:
+                if p.ax3 is not None and event.inaxes is p.ax3:
+                    ax, y = p.ax3, (r["fid"] or {}).get("phase_rel")
+                else:
+                    ax, y = (p.ax1b if sep and key[0] == "OFF" else p.ax1), r["y"] * scale
+                if y is None:
+                    continue
+                xp, yp = ax.transData.transform((r["d1"], y))
+                d = math.hypot(xp - event.x, yp - event.y)
+                if d < dmin:
+                    best, dmin = r, d
+        if best is not None and not self.show_record(best["expno"]):
+            self.set_msg("expno %d has no processed spectrum to show" % best["expno"])
+
+    def on_fit_model(self, event=None):
+        model = list(FIT_MODELS)[max(0, self.fit_combo.current())]
+        self.set_msg(self.analyzer.set_display(fit_model=model))
+        self.refresh(reschedule=False)
+
+    def on_buildup_axes(self):
+        self.set_msg(self.analyzer.set_display(log_d1=bool(self.logd1_var.get()),
+                                               normalize=bool(self.norm_var.get())))
+        self.refresh(reschedule=False)
+
     def on_fid_phase(self):
         self.set_msg(self.analyzer.set_display(show_fid_phase=bool(self.fph_var.get())))
         self.refresh(reschedule=False)
 
     def save_eps(self):
-        path = eps_path(self.runpath)
+        path = eps_path(self.runpath, self.buildup)
         w = self.canvas.get_tk_widget()
         aspect = w.winfo_height() / float(max(1, w.winfo_width()))
         try:
             write_profile_eps(path, self.last_a, aspect)
-            self.set_msg("Wrote %s (%.1f x %.1f in, the profile as shown, for Adobe Illustrator)"
-                         % (path, EPS_WIDTH, min(5.0, max(2.0, EPS_WIDTH * aspect))), error=False)
+            self.set_msg("Wrote %s (%.1f x %.1f in, the %s as shown, for Adobe Illustrator)"
+                         % (path, EPS_WIDTH, min(5.0, max(2.0, EPS_WIDTH * aspect)),
+                            "build-up" if self.buildup else "profile"), error=False)
         except Exception as ex:
             self.set_msg("Could not write %s: %s" % (path, ex))
 
@@ -3112,7 +3963,7 @@ def mode_arg(text):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Plot a DNP frequency profile from a run file (fs_runs/<run id>/run.txt).")
+    ap = argparse.ArgumentParser(description="Plot a DNP frequency profile or build-up from a run file (fs_runs/<run id>/run.txt).")
     ap.add_argument("runfile")
     ap.add_argument("--ppm", type=float, default=None, help="window centre in ppm (default: from run file)")
     ap.add_argument("--width", type=float, default=None, help="full window width in ppm (default: from run file)")
