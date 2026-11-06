@@ -50,7 +50,7 @@ sub-folders of it.
 **New installation**
 
 ```bash
-git clone https://github.com/rspalani/dnp-monitor.git /home/nmrsu/dnp_monitor
+git clone https://github.com/rspalani/dnp-tools.git /home/nmrsu/dnp_monitor
 cd /home/nmrsu/dnp_monitor
 cp dnp_monitor.conf.example dnp_monitor.conf
 chmod 600 dnp_monitor.conf
@@ -65,12 +65,15 @@ into a clone without touching them.
 ```bash
 cd /home/nmrsu/dnp_monitor
 git init
-git remote add origin https://github.com/rspalani/dnp-monitor.git
+git remote add origin https://github.com/rspalani/dnp-tools.git
 git fetch origin
 git checkout -f -b main origin/main     # replaces only the programs (and adds frequency_profile/)
 ```
 
 **Updating later**: close the monitor, then `git pull` in that folder, and start it again.
+A clone made when the repository was still called `dnp-monitor` keeps working (GitHub
+redirects the old address); `git remote set-url origin https://github.com/rspalani/dnp-tools.git`
+in that folder makes it use the new name.
 
 ### Configuration
 
