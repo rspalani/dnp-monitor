@@ -183,6 +183,32 @@ Build-up runs
     of the records still to come (from settings.txt), and the run counts as
     quiet only when the next record is overdue.
 
+Error bars ('Error bars' in the main window; error_bars in phase.txt)
+    noise floor  +/-1 sigma of each record from the noise of its own spectrum: the
+                 points outside the intensity window (the whole spectrum if there is
+                 none) less a cubic, with peaks excluded as in the baseline fit, or the
+                 ppm range given in the row below the top bar, less a straight line;
+                 the spectrum is taken with the applied phase, magnitude and baseline
+                 settings. 'sum' and the window integral: the sigma of a sum of the m
+                 points of the window, from sigma and the autocorrelation of the noise
+                 (zero filling and apodization correlate neighbouring points);
+                 'extreme' and 'max': sigma of one point, an upper bound (when the peak
+                 top spans several points the maximum scatters less, by up to a factor
+                 of about 1.5 for white noise); FID(t0): from the noise of the last
+                 quarter of the fid (sigma/sqrt(N) for the mean, the extrapolation error
+                 of the line for the fit). Divided by NS (FID(t0): NS*RG); for
+                 I_on/I_off - 1 combined with the sigma of the start OFF of the set.
+    repeats      the mean of the records at the same frequency (profile) or D1
+                 (build-up, ON and OFF separately) over the sets (and a D1 repeated in
+                 D1_LIST), +/- its standard error, std/sqrt(n); one series instead of one
+                 per set. A point from one record has no bar.
+    For build-ups, 'weight the fits by 1/sigma^2' (fit_sigma) fits with these sigmas
+    instead of NS and takes the standard errors from them; chi2/dof then compares the
+    scatter with the error bars (about 1 if the noise explains it). With repeats, this
+    needs at least 3 records at every D1; otherwise the fit stays weighted by NS. With
+    error bars on, values.tsv and records.csv get the sigma (or mean, standard error,
+    and number of records) of each record; with them off, the files are as before.
+
 The terminal command that reopens this plot for this run file (including any
 --ppm, --width, --mode and --csv given) is shown in the window title, in the
 'Reopen' field of the top bar (to copy), along the bottom of plot.png, and in the
@@ -470,6 +496,183 @@ def measure(ppm, data, center, width, mode):
 
 
 # --------------------------------------------------------------------------
+# Error bars: noise floor of a record, and repeated records
+# --------------------------------------------------------------------------
+ERROR_MODES = OrderedDict([("none", "none"), ("noise", "noise floor"), ("repeats", "repeats")])
+NOISE_MIN_POINTS = 50       # noise points needed for an estimate
+NOISE_LAGS = 64             # largest lag of the noise autocorrelation used for sums
+
+
+def spectrum_noise(y, ppm, center, width, region=None):
+    """The noise of a spectrum: (sigma of one point, autocorrelation rho[k-1] of the noise
+    at lags k = 1.., mask of the noise points). region (lo, hi) ppm: those points, less a
+    straight line; None: the points outside the intensity window (the whole spectrum if
+    there is none) less a cubic, with peaks excluded as in the baseline fit (points more
+    than 3 robust standard deviations from the fit, and their neighbours). sigma is the
+    standard deviation of the remaining points about the fit. Raises ValueError if fewer
+    than NOISE_MIN_POINTS points are left."""
+    n = y.size
+    x = np.linspace(-1.0, 1.0, n)
+    if region is not None:
+        lo, hi = min(region), max(region)
+        mask0 = (ppm >= lo) & (ppm <= hi)
+        order = 1
+    else:
+        mask0 = np.ones(n, dtype=bool) if center is None else np.abs(ppm - center) > width / 2.0
+        order = 3
+    if mask0.sum() < NOISE_MIN_POINTS:
+        raise ValueError("noise region has %d points (at least %d needed)" % (mask0.sum(), NOISE_MIN_POINTS))
+    pad = max(2, n // 400)
+    idx_all = np.arange(n)
+    lo_i = np.clip(idx_all - pad, 0, n)
+    hi_i = np.clip(idx_all + pad + 1, 0, n)
+    mask = mask0.copy()
+    r = None
+    for _ in range(20):
+        idx = np.nonzero(mask)[0]
+        coef = np.polynomial.polynomial.polyfit(x[idx], y[idx], order)
+        r = y - np.polynomial.polynomial.polyval(x, coef)
+        rk = r[idx]
+        s = 1.4826 * np.median(np.abs(rk - np.median(rk)))
+        if not s > 0:
+            break
+        c = np.concatenate(([0], np.cumsum(np.abs(r) > 3.0 * s)))
+        new = mask0 & ((c[hi_i] - c[lo_i]) == 0)
+        if np.array_equal(new, mask) or new.sum() < NOISE_MIN_POINTS:
+            break
+        mask = new
+    m = mask.astype(float)
+    z = r * m
+    cnt = float(m.sum())
+    sd = math.sqrt(float(np.dot(z, z)) / cnt)
+    rho = np.zeros(NOISE_LAGS)
+    if sd > 0:
+        for k in range(1, NOISE_LAGS + 1):
+            both = float(np.dot(m[:-k], m[k:]))
+            if both < 20:
+                break
+            rho[k - 1] = float(np.dot(z[:-k], z[k:])) / (both * sd * sd)
+        # keep the lags up to the first one that is no longer clearly correlated
+        small = np.nonzero(rho < max(0.05, 2.0 / math.sqrt(cnt)))[0]
+        if small.size:
+            rho[small[0]:] = 0.0
+    return sd, rho, mask
+
+
+def sum_noise_factor(m, rho):
+    """sqrt of the variance of a sum of m consecutive noise points in units of the
+    variance of one point: sqrt(m + 2*sum_k (m - k)*rho_k)."""
+    m = int(m)
+    k = np.arange(1, min(m - 1, rho.size) + 1)
+    v = m + 2.0 * float(np.sum((m - k) * rho[:k.size]))
+    return math.sqrt(max(v, 1.0))
+
+
+def window_points(ppm, center, width):
+    if center is None:
+        return ppm.size
+    return int(np.count_nonzero(np.abs(ppm - center) <= width / 2.0))
+
+
+def measure_noise(ppm, y, center, width, mode, region=None):
+    """sigma of measure(ppm, y, center, width, mode) and of integrate(...) from the noise of
+    y: (sigma value, sigma integral, sigma of one point). extreme and max: one point;
+    sum: m points of the window, with their correlation (zero filling, apodization)."""
+    sd, rho, _ = spectrum_noise(y, ppm, center, width, region)
+    f = sum_noise_factor(window_points(ppm, center, width), rho)
+    step = abs(float(ppm[0] - ppm[1])) if ppm.size > 1 else 1.0
+    return (sd * f if mode == "sum" else sd), sd * f * step, sd
+
+
+def read_fid_tail(expdir):
+    """The last quarter of the raw fid (at least 256 complex points), complex."""
+    acq = jcamp_params(os.path.join(expdir, "acqus"), ACQUS_KEYS)
+    dtypa = int(float(acq["DTYPA"]))
+    endian = ">" if int(float(acq["BYTORDA"])) == 1 else "<"
+    if dtypa == 0:
+        dtype, scale, size = endian + "i4", 2.0 ** int(float(acq.get("NC", "0"))), 4
+    elif dtypa == 2:
+        dtype, scale, size = endian + "f8", 1.0, 8
+    else:
+        raise ValueError("DTYPA = %d in acqus" % dtypa)
+    td = int(float(acq["TD"])) // 2 * 2
+    have = os.path.getsize(os.path.join(expdir, "fid")) // size
+    td = min(td, have // 2 * 2)
+    n = max(256, td // 8) * 2                # real numbers in the tail
+    n = min(n, td)
+    f = np.fromfile(os.path.join(expdir, "fid"), dtype=dtype, count=n,
+                    offset=(td - n) * size).astype(float) * scale
+    return f[0::2] + 1j * f[1::2]
+
+
+def fid_noise_sigma(tail):
+    """Noise of one complex fid point (per component), from the tail less a straight line
+    (robust standard deviation of the real and imaginary residuals)."""
+    if tail.size < 32:
+        raise ValueError("fid tail too short for a noise estimate")
+    k = np.arange(tail.size, dtype=float)
+    res = []
+    for part in (tail.real, tail.imag):
+        c = np.polyfit(k, part, 1)
+        res.append(part - np.polyval(c, k))
+    r = np.concatenate(res)
+    return 1.4826 * float(np.median(np.abs(r - np.median(r))))
+
+
+def fid_t0_sigma(fid, n, fit, sigma_c):
+    """sigma of FID(t0) per NS*RG for noise sigma_c per point and component: the mean of N
+    magnitudes, sigma_c/sqrt(N); the line at t = GRPDLY, the usual extrapolation error of a
+    straight line (consecutive points taken as independent)."""
+    norm = float(fid["ns"]) * fid["rg"]
+    n = int(n)
+    if not fit or n < 2:
+        return sigma_c / math.sqrt(n) / norm
+    k = np.arange(fid["g"], fid["g"] + n, dtype=float)
+    d = float(np.sum((k - k.mean()) ** 2))
+    return sigma_c * math.sqrt(1.0 / n + (fid["grpdly"] - k.mean()) ** 2 / d) / norm
+
+
+def ratio_sigma(v, ev, ref, eref):
+    """sigma of v/ref - 1 (or v/ref) from the sigmas of v and ref."""
+    if ev is None or eref is None or not ref:
+        return None
+    return math.sqrt(ev ** 2 + (v * eref / ref) ** 2) / abs(ref)
+
+
+def repeat_means(recs, xkey, ykey, nd=6):
+    """Records grouped by x (rounded to nd decimals): [{"x", "y" mean, "e" standard error of
+    the mean (None for one record), "n", "ns" (total scans), "recs"}], sorted by x."""
+    groups = OrderedDict()
+    for r in recs:
+        if r.get(ykey) is None or r.get(xkey) is None:
+            continue
+        groups.setdefault(round(r[xkey], nd), []).append(r)
+    out = []
+    for x in sorted(groups):
+        g = groups[x]
+        ys = np.array([r[ykey] for r in g], dtype=float)
+        e = float(np.std(ys, ddof=1) / math.sqrt(ys.size)) if ys.size > 1 else None
+        out.append({"x": float(np.mean([r[xkey] for r in g])), "y": float(np.mean(ys)), "e": e,
+                    "n": ys.size, "ns": sum((r["ns"] or r["ns_run"]) for r in g), "recs": g})
+    return out
+
+
+def error_text(a, ascii_only=False):
+    """What the error bars show, for the info rows, the PNG and the TSV ('' without)."""
+    em = a.get("error_bars", "none")
+    pm = "+/-" if ascii_only else "±"
+    if em == "noise":
+        reg = a.get("noise_region")
+        where = ("%.4g to %.4g ppm" % (min(reg), max(reg))) if reg else "outside the window, peaks excluded"
+        if a["fid_mode"]:
+            where = "the last quarter of each fid"
+        return "error bars %s1%s from the noise floor (%s)" % (pm, " sigma" if ascii_only else "σ", where)
+    if em == "repeats":
+        return "mean %s standard error over repeated records" % pm
+    return ""
+
+
+# --------------------------------------------------------------------------
 # Phase and baseline correction
 # --------------------------------------------------------------------------
 PH0_RANGE = 180.0
@@ -509,7 +712,8 @@ def default_phase():
             "baseline": False, "order": 3, "magnitude": False,
             "win_set": False, "center": None, "width": 20.0, "mode": "extreme",
             "show_integral": False, "fid_n": 4, "fid_fit": False, "show_fid_phase": False,
-            "fit_model": "mono", "log_d1": False, "normalize": False}
+            "fit_model": "mono", "log_d1": False, "normalize": False,
+            "error_bars": "none", "noise_from": None, "noise_to": None, "fit_sigma": False}
 
 
 def phase_active(ph):
@@ -519,7 +723,9 @@ def phase_active(ph):
 def phase_key(ph):
     """Changes whenever any viewer setting changes."""
     return proc_key(ph) + (bool(ph.get("show_integral")), bool(ph.get("show_fid_phase")),
-                           ph.get("fit_model", "mono"), bool(ph.get("log_d1")), bool(ph.get("normalize")))
+                           ph.get("fit_model", "mono"), bool(ph.get("log_d1")), bool(ph.get("normalize")),
+                           ph.get("error_bars", "none"), ph.get("noise_from"), ph.get("noise_to"),
+                           bool(ph.get("fit_sigma")))
 
 
 def proc_key(ph):
@@ -739,6 +945,11 @@ def read_phase_file(path):
         ph["fit_model"] = vals["fit_model"]
     ph["log_d1"] = bool(int(num("log_d1", 0)))
     ph["normalize"] = bool(int(num("normalize", 0)))
+    if vals.get("error_bars") in ERROR_MODES:
+        ph["error_bars"] = vals["error_bars"]
+    ph["noise_from"] = num("noise_from", None)
+    ph["noise_to"] = num("noise_to", None)
+    ph["fit_sigma"] = bool(int(num("fit_sigma", 0)))
     if "window_width" in vals:
         ph["win_set"] = True
         ph["center"] = num("window_center", None)
@@ -766,19 +977,23 @@ def write_phase_file(path, ph, runpath):
         "# to t = GRPDLY) set mode FID(t0); show_fid_phase = 1 shows the FID phase panel.\n"
         "# Build-up runs: fit_model (mono, offset, stretched, biexp), log_d1 = 1 for a\n"
         "# logarithmic D1 axis, normalize = 1 to divide each series by its fitted S_inf.\n"
+        "# error_bars: none, noise (noise floor; noise_from/noise_to in ppm, none =\n"
+        "# outside the window) or repeats; fit_sigma = 1 weights build-up fits by 1/sigma^2.\n"
         "# fs_rephase.py (TopSpin)\n"
         "# applies the phase to the TopSpin data; everything else stays in the viewer.\n"
         "ph0 = %s\nph1 = %s\npivot_ppm = %s\nbase_phc0 = %s\nbase_phc1 = %s\n"
         "baseline = %d\nbaseline_order = %d\nmagnitude = %d\nshow_integral = %d\n"
         "fid_points = %d\nfid_fit = %d\nshow_fid_phase = %d\n"
-        "fit_model = %s\nlog_d1 = %d\nnormalize = %d\n%s"
+        "fit_model = %s\nlog_d1 = %d\nnormalize = %d\n"
+        "error_bars = %s\nnoise_from = %s\nnoise_to = %s\nfit_sigma = %d\n%s"
         % (run_label(runpath), time.strftime("%Y-%m-%d %H:%M:%S"),
            v(ph["ph0"]), v(ph["ph1"]), v(ph["pivot"]), v(ph["base0"]), v(ph["base1"]),
            1 if ph["baseline"] else 0, int(ph["order"]), 1 if ph["magnitude"] else 0,
            1 if ph.get("show_integral") else 0, int(ph.get("fid_n", 4)),
            1 if ph.get("fid_fit") else 0, 1 if ph.get("show_fid_phase") else 0,
            ph.get("fit_model", "mono"), 1 if ph.get("log_d1") else 0, 1 if ph.get("normalize") else 0,
-           window))
+           ph.get("error_bars", "none"), v(ph.get("noise_from")), v(ph.get("noise_to")),
+           1 if ph.get("fit_sigma") else 0, window))
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         fh.write(text)
@@ -794,6 +1009,8 @@ FIT_MODELS = OrderedDict([
     ("stretched", "stretched exponential"),
     ("biexp", "bi-exponential"),
 ])
+FIT_SHORT = {"mono": "mono-exp.", "offset": "mono + S₀", "stretched": "stretched",
+             "biexp": "bi-exp."}           # in the window's list
 FIT_FORMULAS = {                          # ASCII, for the TSV, the CSV and the PNG
     "mono": "S_inf*(1 - exp(-D1/T_B))",
     "offset": "S_inf - (S_inf - S_0)*exp(-D1/T_B)",
@@ -880,17 +1097,19 @@ def _nelder_mead(f, x0, step, iters=800):
     return pts[i], vals[i]
 
 
-def fit_buildup(t, y, w, model):
+def fit_buildup(t, y, w, model, absolute=False):
     """Weighted least squares fit of the build-up y(t) (weights w: NS, as the noise of an
     intensity per scan goes as 1/sqrt(NS)). The amplitudes are linear; the times (and beta)
     are searched on a grid over 1/30 of the shortest to 30 times the longest D1, then
-    refined. Returns a dict (see the end); raises ValueError if there are too few points."""
+    refined. absolute=True: w = 1/sigma^2 of each point, and the standard errors come from
+    these sigmas (not from the scatter); chi2_red then compares the scatter with them.
+    Returns a dict (see the end); raises ValueError if there are too few points."""
     t, y, w = (np.asarray(v, dtype=float) for v in (t, y, w))
     k = FIT_NPAR[model]
     if t.size < k:
         raise ValueError("%d point%s; the %s fit needs at least %d"
                          % (t.size, "" if t.size == 1 else "s", FIT_MODELS[model], k))
-    sw = np.sqrt(w / np.mean(w))
+    sw = np.sqrt(w) if absolute else np.sqrt(w / np.mean(w))
     tmin, tmax = float(t.min()), float(t.max())
     lo, hi = math.log(tmin / 30.0), math.log(tmax * 30.0)
     big = 1e300
@@ -949,7 +1168,19 @@ def fit_buildup(t, y, w, model):
             J[:, j] = (fit_model_value(model, pp, t) - fit_model_value(model, pm, t)) / (2 * h)
         Jw = J * sw[:, None]
         try:
-            cov = np.linalg.inv(Jw.T.dot(Jw)) * (chi2 / (n - k))
+            cov = np.linalg.inv(Jw.T.dot(Jw)) * (1.0 if absolute else chi2 / (n - k))
+        except np.linalg.LinAlgError:
+            cov = None
+    elif absolute:
+        try:
+            Jw = np.empty((n, k))
+            for j in range(k):
+                h = 1e-6 * max(abs(p[j]), 1e-12)
+                pp, pm = p.copy(), p.copy()
+                pp[j] += h
+                pm[j] -= h
+                Jw[:, j] = sw * (fit_model_value(model, pp, t) - fit_model_value(model, pm, t)) / (2 * h)
+            cov = np.linalg.inv(Jw.T.dot(Jw))
         except np.linalg.LinAlgError:
             cov = None
 
@@ -1015,7 +1246,8 @@ def fit_buildup(t, y, w, model):
         t_opt, s_opt = float(tt[i]), float(g[i])
     return {"model": model, "p": p, "params": par, "n": n, "chi2_red": chi2 / (n - k) if n > k else None,
             "s_inf": par["S_inf"][0], "times": times, "t_opt": t_opt, "s_opt": s_opt,
-            "notes": notes, "tmin": tmin, "tmax": tmax, "determined": why is None, "why": why}
+            "notes": notes, "tmin": tmin, "tmax": tmax, "determined": why is None, "why": why,
+            "absolute": bool(absolute)}
 
 
 def fmt_pm(v, e):
@@ -1053,12 +1285,21 @@ def fit_summary(f, ascii_only=False):
                      % ("sqrt(t)" if ascii_only else "√t", f["s_opt"], tm(f["t_opt"])))
     else:
         parts.append("max S/%s %.4g at D1 = %s" % ("sqrt(t)" if ascii_only else "√t", f["s_opt"], tm(f["t_opt"])))
+    if f.get("absolute") and f["chi2_red"] is not None:
+        parts.append("%s %.3g" % ("chi2/dof" if ascii_only else "χ²/dof", f["chi2_red"]))
     return ("; " if ascii_only else " · ").join(parts)
+
+
+def fit_weight_text(a, ascii_only=False):
+    if a.get("fit_sigma"):
+        return "weighted by 1/sigma^2" if ascii_only else "weighted by 1/σ²"
+    return "weighted by NS"
 
 
 def ui_text(text):
     """Notes and parameter names for the window (S_inf -> S∞ etc.)."""
-    for a, b in (("S_inf", "S∞"), ("T_1", "T₁"), ("T_2", "T₂"), ("beta", "β"), ("sqrt(t)", "√t")):
+    for a, b in (("S_inf", "S∞"), ("T_1", "T₁"), ("T_2", "T₂"), ("beta", "β"), ("sqrt(t)", "√t"),
+                 ("chi2/dof", "χ²/dof")):
         text = text.replace(a, b)
     return text
 
@@ -1075,6 +1316,8 @@ def fit_summary_ui(f):
               for k in P if k not in first]
     at = fmt_time(f["t_opt"]) + (" (1.26 T_B)" if f["model"] == "mono" else "")
     parts.append("max S/√t %.4g at %s" % (f["s_opt"], at))
+    if f.get("absolute") and f["chi2_red"] is not None:
+        parts.append("χ²/dof %.3g" % f["chi2_red"])
     return " · ".join(parts)
 
 
@@ -1091,13 +1334,51 @@ def buildup_series(results):
     return out
 
 
-def buildup_fits(results, model):
-    """{(kind, set): fit_buildup result, or {"error": text}} for each series."""
-    fits = OrderedDict()
+def buildup_view(results, errm):
+    """The points of each build-up series: {(kind, set): {"x", "y", "e" (sigma or None per
+    point), "ns" (scans per point), "n" (records per point), "recs" (the records of each
+    point)}}. With errm 'repeats', one series per kind (set 0): the mean over the records
+    with the same D1 (in any set), with its standard error."""
+    out = OrderedDict()
+    if errm == "repeats":
+        for kind in ("ON", "OFF"):
+            g = repeat_means([r for r in results if r["kind"] == kind and r["y"] is not None
+                              and r["d1"] is not None], "d1", "y")
+            if g:
+                out[(kind, 0)] = {"x": [q["x"] for q in g], "y": [q["y"] for q in g],
+                                  "e": [q["e"] for q in g], "ns": [q["ns"] for q in g],
+                                  "n": [q["n"] for q in g], "recs": [q["recs"] for q in g]}
+        return out
     for key, pts in buildup_series(results).items():
+        out[key] = {"x": [r["d1"] for r in pts], "y": [r["y"] for r in pts],
+                    "e": [r.get("ey") for r in pts], "ns": [r["ns"] if r["ns"] else r["ns_run"] for r in pts],
+                    "n": [1] * len(pts), "recs": [[r] for r in pts]}
+    return out
+
+
+def buildup_fits(view, model, fit_sigma=False):
+    """{(kind, set): fit_buildup result, or {"error": text}} for each series of the view;
+    weighted by 1/sigma^2 if fit_sigma and every point has an error bar, else by NS."""
+    fits = OrderedDict()
+    for key, v in view.items():
+        e = v["e"]
+        use_sigma = fit_sigma and all(x is not None and x > 0 for x in e)
+        rough = key[1] == 0 and min(v["n"]) < 3       # standard errors of 2 records: too rough
         try:
-            fits[key] = fit_buildup([r["d1"] for r in pts], [r["y"] for r in pts],
-                                    [r["ns"] if r["ns"] else r["ns_run"] for r in pts], model)
+            if use_sigma and not rough:
+                f = fit_buildup(v["x"], v["y"], [1.0 / x ** 2 for x in e], model, absolute=True)
+                if f["chi2_red"] is not None and f["chi2_red"] > 3:
+                    f["notes"].append("scatter about %.2g times the error bars (chi2/dof %.3g)%s"
+                                      % (math.sqrt(f["chi2_red"]), f["chi2_red"],
+                                         "" if key[1] == 0 else "; for a weak signal the extreme or max "
+                                         "of the window follows the noise, 'sum' does not"))
+            else:
+                f = fit_buildup(v["x"], v["y"], v["ns"], model)
+                if fit_sigma:
+                    f["notes"].append("weighted by NS: %s" % (
+                        "fewer than 3 records at some D1, too few for weights from their spread" if rough
+                        else "not every point has an error bar"))
+            fits[key] = f
         except (ValueError, np.linalg.LinAlgError, FloatingPointError, OverflowError) as ex:
             fits[key] = {"error": str(ex)}
     return fits
@@ -1137,6 +1418,8 @@ class Analyzer:
         self.fids = {}               # expdir -> (fid_file_key, read_fid result)
         self.fid_warned = set()
         self.csv_cache, self.csv_tag = {}, None
+        self.sigmas = {}             # noise-floor sigmas per record and settings
+        self.fid_sigmas = {}         # expdir -> (fid_file_key, noise of one fid point)
         # --ppm/--width/--mode take precedence over a window in the settings file
         # until a window is applied from the spectrum pane
         self.cli_window = (args.ppm is not None or args.width is not None
@@ -1172,8 +1455,8 @@ class Analyzer:
     def set_display(self, **flags):
         """Sets display-only settings (show_integral, show_fid_phase; for build-ups fit_model,
         log_d1, normalize) and saves them. Returns an error text or ''."""
-        self.phase = dict(self.phase, **dict((k, v if isinstance(v, str) else bool(v))
-                                             for k, v in flags.items()))
+        bools = ("show_integral", "show_fid_phase", "log_d1", "normalize", "fit_sigma")
+        self.phase = dict(self.phase, **dict((k, bool(v) if k in bools else v) for k, v in flags.items()))
         try:
             write_phase_file(self.phase_path, self.phase, self.runpath)
             self.phase_mtime = os.path.getmtime(self.phase_path)
@@ -1277,6 +1560,42 @@ class Analyzer:
             out["note"] = str(ex)
         return out
 
+    def _noise(self, ds_dir, r, ph, center, width, mode, region):
+        """{"err": sigma of the value, "err_int": of the integral, "noise": of one point (all
+        per scan, FID(t0) per NS*RG), "note"} from the noise floor of the record."""
+        key = (r["expno"], r["files"], proc_key(ph), center, width, mode, region,
+               int(ph["fid_n"]), bool(ph["fid_fit"]))
+        hit = self.sigmas.get(key)
+        if hit is not None:
+            return hit
+        out = {"err": None, "err_int": None, "noise": None, "note": ""}
+        try:
+            spec = self.spectrum(ds_dir, r["expno"], r["files"])
+            y, _, _ = corrected(spec, ph, center, width)
+            ns = float(spec["ns"])
+            ev, ei, sd = measure_noise(spec["ppm"], y, center, width,
+                                       "sum" if mode == FID_MODE else mode, region)
+            out.update(err=None if mode == FID_MODE else ev / ns, err_int=ei / ns, noise=sd / ns)
+        except Exception as ex:
+            out["note"] = "noise: %s" % ex
+        if mode == FID_MODE:
+            try:
+                expdir = os.path.join(ds_dir, str(r["expno"]))
+                fkey = fid_file_key(expdir)
+                hit = self.fid_sigmas.get(expdir)
+                if hit is None or hit[0] != fkey:
+                    hit = (fkey, fid_noise_sigma(read_fid_tail(expdir)))
+                    self.fid_sigmas[expdir] = hit
+                fid = self.fid(ds_dir, r["expno"])
+                if fid["g"] is not None:
+                    out["err"] = fid_t0_sigma(fid, ph["fid_n"], ph["fid_fit"], hit[1])
+            except Exception as ex:
+                out["note"] = "; ".join([x for x in (out["note"], "fid noise: %s" % ex) if x])
+        if len(self.sigmas) > 20000:
+            self.sigmas.clear()
+        self.sigmas[key] = out
+        return out
+
     def run(self, force_fid=False):
         """force_fid: also read the fids when neither the mode nor the phase panel needs them
         (CSV export)."""
@@ -1298,6 +1617,11 @@ class Analyzer:
             center, width, mode = ph["center"], ph["width"], ph["mode"]
         skey = proc_key(ph)
         buildup = meta.get("type") == "buildup"
+        errm = ph.get("error_bars", "none")
+        region = None
+        if ph.get("noise_from") is not None and ph.get("noise_to") is not None \
+                and ph["noise_from"] != ph["noise_to"]:
+            region = (float(ph["noise_from"]), float(ph["noise_to"]))
         fid_mode = mode == FID_MODE
         need_fid = force_fid or fid_mode or bool(ph.get("show_fid_phase"))
 
@@ -1343,6 +1667,16 @@ class Analyzer:
                 except Exception:
                     latest_fid = None
 
+        for r in results:
+            r.update(err=None, err_int=None, noise=None, err_note="")
+            if errm == "noise" and r["files"] is not None:
+                n = self._noise(ds_dir, r, ph, center, width, mode, region)
+                r.update(err=n["err"], err_int=n["err_int"], noise=n["noise"], err_note=n["note"])
+                for k, v in (("err", r["value"]), ("err_int", r["integral"])):
+                    if r[k] is not None and v is not None and not r[k] > 1e-9 * abs(v):
+                        r[k] = None                  # no measurable noise (e.g. simulated data)
+                        r["err_note"] = r["err_note"] or "noise: none measurable"
+
         off_mode = meta.get("off_mode", "none")
         starts = {}
         for r in results:
@@ -1371,12 +1705,31 @@ class Analyzer:
                 r["note"] = (r["note"] + "; " if r["note"] else "") + \
                     "no usable start OFF in set %d" % r["set"]
 
-        fits = OrderedDict()
         if buildup:                              # ON and OFF are both series, against D1
             for r in results:
                 r["y"] = r["value"] if r["d1"] is not None else None
                 r["yi"] = None
-            fits = buildup_fits(results, ph.get("fit_model", "mono"))
+        # sigma of y and yi from the noise floor (ratio to the start OFF of the set)
+        for r in results:
+            r["ey"] = r["eyi"] = None
+            if errm != "noise":
+                continue
+            if r["y"] is not None:
+                if buildup or not use_enh:
+                    r["ey"] = r["err"]
+                elif r["set"] in valid:
+                    o = valid[r["set"]]
+                    r["ey"] = ratio_sigma(r["value"], r["err"], o["value"], o["err"])
+            if r.get("yi") is not None:
+                if not use_enh:
+                    r["eyi"] = r["err_int"]
+                elif r["set"] in valid_i:
+                    o = valid_i[r["set"]]
+                    r["eyi"] = ratio_sigma(r["integral"], r["err_int"], o["integral"], o["err_int"])
+        fits = OrderedDict()
+        if buildup:
+            fits = buildup_fits(buildup_view(results, errm), ph.get("fit_model", "mono"),
+                                bool(ph.get("fit_sigma")) and errm != "none")
 
         latest = None
         readable = [r for r in results if r["readable"]]
@@ -1398,6 +1751,8 @@ class Analyzer:
                 "show_fid_phase": bool(ph.get("show_fid_phase")), "need_fid": need_fid,
                 "fid_ref": fid_ref, "latest_fid": latest_fid, "plan": run_plan(self.runpath),
                 "buildup": buildup, "fits": fits, "fit_model": ph.get("fit_model", "mono"),
+                "error_bars": errm, "noise_region": region,
+                "fit_sigma": bool(ph.get("fit_sigma")) and errm != "none",
                 "log_d1": bool(ph.get("log_d1")), "normalize": bool(ph.get("normalize")),
                 "planned": planned_records(self.runpath) if buildup else None}
 
@@ -1478,6 +1833,13 @@ class Analyzer:
             cols.insert(5, "d1_s")
             for row, r in zip(rows, a["results"]):
                 row.insert(5, "" if r["d1"] is None else "%g" % r["d1"])
+        if a.get("error_bars") == "noise":       # noise-floor sigmas at the end
+            cols += ["noise_sigma_point_per_scan", "sigma_value", "sigma_integral"]
+            head.append("noise_sigma_point_per_scan: noise of one spectrum point; sigma_value: of the "
+                        "intensity measure (FID(t0): per NS*RG, from the fid tail); sigma_integral: of the "
+                        "window integral with the viewer's settings (%s)" % error_text(a, ascii_only=True))
+            for row, r in zip(rows, a["results"]):
+                row += [g6(r.get("noise")), g6(r.get("err")), g6(r.get("err_int"))]
         tmp = path + ".tmp"
         with open(tmp, "w", newline="") as fh:
             for h in head:
@@ -1661,6 +2023,8 @@ def profile_info(a, runpath):
         meas.append(proc_txt)
         if a["show_integral"] and a["mode"] != "sum":
             meas.append("window integral also plotted")
+    if a.get("error_bars", "none") != "none":
+        meas.append(error_text(a))
     rows.append(("Measure", " · ".join(meas), False))
     unit = "per NS·RG" if fidm else "per scan"
     offs = [r for r in res if r["kind"] == "OFF"]
@@ -1695,6 +2059,8 @@ def profile_info(a, runpath):
 
 def series_name(key, multi):
     kind, s = key
+    if s == 0:                                   # mean over repeated records
+        return "%s mean" % kind
     return ("%s set %d" % (kind, s)) if multi else kind
 
 
@@ -1724,7 +2090,10 @@ def buildup_info(a, runpath):
         proc = spectrum_status(a)
         meas = [window_text(a).replace("+/-", "±"), a["mode"],
                 "; ".join(proc) if proc else "spectra as processed by TopSpin"]
-    meas.append("fit: %s %s, weighted by NS, ± 1 standard error" % (FIT_MODELS[model], FIT_FORMULAS_UI[model]))
+    meas.append("fit: %s %s, %s, ± 1 standard error" % (FIT_MODELS[model], FIT_FORMULAS_UI[model],
+                                                         fit_weight_text(a)))
+    if a["error_bars"] != "none":
+        meas.append(error_text(a))
     rows.append(("Measure", " · ".join(meas), False))
     multi = a["multi_set"]
     notes = []
@@ -1741,7 +2110,7 @@ def buildup_info(a, runpath):
             txt.append("S∞ %.4g" % r1)
         if r2 is not None:
             txt.append("max S/√t %.4g" % r2)
-        rows.append(("ON/OFF" if not multi else "ON/OFF %d" % s, " · ".join(txt), False))
+        rows.append(("ON/OFF" if (not multi or s == 0) else "ON/OFF %d" % s, " · ".join(txt), False))
     if not a["fits"]:
         rows.append(("", "waiting for the first record", False))
     if notes:
@@ -1769,8 +2138,11 @@ def write_buildup_tsv(path, a):
                  % (what, "FID(t0) per NS*RG" if a["fid_mode"] else "intensity per scan"))
         st = phase_status(a)
         fh.write("# %s\n" % ("; ".join(st) if st else "phase: as processed by TopSpin"))
-        fh.write("# fit: %s, %s; least squares weighted by NS; +/- one standard error\n"
-                 % (FIT_MODELS[a["fit_model"]], FIT_FORMULAS[a["fit_model"]]))
+        fh.write("# fit: %s, %s; least squares %s; +/- one standard error\n"
+                 % (FIT_MODELS[a["fit_model"]], FIT_FORMULAS[a["fit_model"]], fit_weight_text(a, True)))
+        em = a["error_bars"]
+        if em != "none":
+            fh.write("# %s\n" % error_text(a, ascii_only=True))
         for key, f in fits.items():
             name = series_name(key, a["multi_set"])
             if "error" in f:
@@ -1781,20 +2153,33 @@ def write_buildup_tsv(path, a):
                                           "".join("; NOTE: " + n for n in notes)))
         for s, r1, r2 in fit_ratios(a):
             fh.write("# ON/OFF%s: S_inf ratio %s; max S/sqrt(t) ratio %s\n"
-                     % (" set %d" % s if a["multi_set"] else "",
+                     % (" set %d" % s if (a["multi_set"] and s) else "",
                         "-" if r1 is None else "%.4g" % r1, "-" if r2 is None else "%.4g" % r2))
-        fh.write("expno\tkind\tlabel\tset\td1_s\tns\tintensity_per_scan\tppm_of_point\tfit_per_scan\tnote\n")
+        view = buildup_view(a["results"], em)
+        extra = {"none": "", "noise": "\tsigma_per_scan", "repeats": "\tmean_per_scan\tsem_per_scan\tn_repeats"}[em]
+        fh.write("expno\tkind\tlabel\tset\td1_s\tns\tintensity_per_scan\tppm_of_point\tfit_per_scan\tnote%s\n"
+                 % extra)
         for r in a["results"]:
-            f = fits.get((r["kind"], r["set"]))
+            f = fits.get((r["kind"], 0 if em == "repeats" else r["set"]))
             fv = ""
             if f is not None and "error" not in f and r["d1"] is not None:
                 fv = "%.6g" % fit_model_value(f["model"], f["p"], [r["d1"]])[0]
-            fh.write("%d\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n" % (
+            cols = ""
+            if em == "noise":
+                cols = "\t" + ("" if r["ey"] is None else "%.4g" % r["ey"])
+            elif em == "repeats":
+                vp = view_point(view, r)
+                if vp is None:
+                    cols = "\t\t\t"
+                else:
+                    v, i = view[vp[0]], vp[1]
+                    cols = "\t%.6g\t%s\t%d" % (v["y"][i], "" if v["e"][i] is None else "%.4g" % v["e"][i], v["n"][i])
+            fh.write("%d\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s%s\n" % (
                 r["expno"], r["kind"], r["label"], r["set"],
                 "" if r["d1"] is None else "%g" % r["d1"],
                 r["ns"] if r["ns"] is not None else r["ns_run"],
                 "" if r["value"] is None else "%.6g" % r["value"],
-                "" if r["at"] is None else "%.2f" % r["at"], fv, r["note"]))
+                "" if r["at"] is None else "%.2f" % r["at"], fv, r["note"], cols))
 
 
 def write_tsv(path, a):
@@ -1811,10 +2196,24 @@ def write_tsv(path, a):
                     "I_on/I_off - 1 (start OFF of the set)" if a["use_enh"] else "intensity per scan"))
         st = phase_status(a)
         fh.write("# %s\n" % ("; ".join(st) if st else "phase: as processed by TopSpin"))
+        em = a.get("error_bars", "none")
+        if em != "none":
+            fh.write("# %s\n" % error_text(a, ascii_only=True))
+        extra = {"none": "", "noise": "\tsigma_per_scan\ty_sigma\tintegral_sigma\ty_integral_sigma",
+                 "repeats": "\ty_mean\ty_sem\tn_repeats"}[em]
         fh.write("expno\tkind\tlabel\tfreq_GHz\tns\tintensity_per_scan\tppm_of_point\ty\tnote\tset"
-                 "\tintegral_per_scan\ty_integral\n")
+                 "\tintegral_per_scan\ty_integral%s\n" % extra)
+        groups = profile_means(dict(a, show_integral=False))[0] if em == "repeats" else []
         for r in a["results"]:
-            fh.write("%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n" % (
+            extra = ""
+            if em == "noise":
+                vals = [r.get("err"), r.get("ey"), r.get("err_int"), r.get("eyi")]
+                extra = "".join("\t" + ("" if v is None else "%.4g" % v) for v in vals)
+            elif em == "repeats":
+                m = [q for q in groups if r in q["recs"]]
+                extra = ("\t%.6g\t%s\t%d" % (m[0]["y"], "" if m[0]["e"] is None else "%.4g" % m[0]["e"],
+                                              m[0]["n"])) if m else "\t\t\t"
+            fh.write("%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s%s\n" % (
                 r["expno"], r["kind"], r["label"],
                 "-" if r["freq"] is None else "%.4f" % r["freq"],
                 r["ns"] if r["ns"] is not None else r["ns_run"],
@@ -1823,7 +2222,7 @@ def write_tsv(path, a):
                 "" if r["y"] is None else "%.6g" % r["y"],
                 r["note"], r["set"],
                 "" if r["integral"] is None else "%.6g" % r["integral"],
-                "" if r.get("yi") is None else "%.6g" % r["yi"]))
+                "" if r.get("yi") is None else "%.6g" % r["yi"], extra))
 
 
 # --------------------------------------------------------------------------
@@ -1965,6 +2364,59 @@ def draw_fid_phase(ax3, a, compact=False):
     ax3.grid(True, color="0.9")
 
 
+def error_bars(ax, recs, xkey, ykey, ekey, color, lw=0.9, scale=1.0):
+    """Error bars (no markers) at the records that have a sigma; returns the artists."""
+    pts = [r for r in recs if r.get(ekey) is not None and r.get(ykey) is not None]
+    if not pts:
+        return []
+    c = ax.errorbar([r[xkey] for r in pts], [r[ykey] * scale for r in pts],
+                    yerr=[r[ekey] * scale for r in pts], fmt="none", ecolor=color, elinewidth=lw,
+                    capsize=2.5, zorder=2.5)
+    return [x for x in [c.lines[0]] + list(c.lines[1]) + list(c.lines[2]) if x is not None]
+
+
+def profile_means(a):
+    """Means over the sets at each frequency: (peak or FID(t0) groups, integral groups)."""
+    on = [r for r in a["results"] if r["kind"] == "ON" and r["y"] is not None and r["freq"] is not None]
+    g = repeat_means(on, "freq", "y", nd=4)
+    gi = repeat_means([r for r in on if r.get("yi") is not None], "freq", "yi", nd=4) \
+        if a["show_integral"] else []
+    return g, gi
+
+
+def draw_profile_repeats(ax1, ax_int, a, ms=5, lw=1.2, latest=True):
+    """The profile as the mean over the sets at each frequency with its standard error
+    (and the window integral on ax_int). Returns the artists."""
+    g, gi = profile_means(a)
+    if not g:
+        return []
+    col = SET_COLORS[0]
+    nsets = max(q["n"] for q in g)
+    what = ("FID(t0)" if a["fid_mode"] else "peak") if a["show_integral"] else ""
+    label = "mean of %d sets%s" % (nsets, (", " + what) if what else "")
+    arts = error_bars(ax1, [{"x": q["x"], "y": q["y"], "e": q["e"]} for q in g], "x", "y", "e", col)
+    arts += ax1.plot([q["x"] for q in g], [q["y"] for q in g], "-o", color=col,
+                     ms=ms if len(g) < 150 else 3, lw=lw, label=label)
+    on = [r for q in g for r in q["recs"]]
+    if latest and on:
+        r = max(on, key=lambda q: q["expno"])
+        m = [q for q in g if r in q["recs"]][0]
+        ax1.plot([m["x"]], [m["y"]], "o", color="#c0392b", ms=8, zorder=3)
+    if gi:
+        if ax_int is not ax1:
+            ax_int.set_visible(True)
+            ax_int.set_ylabel("integral per scan (a.u. x ppm)")
+        arts += error_bars(ax_int, [{"x": q["x"], "y": q["y"], "e": q["e"]} for q in gi], "x", "y", "e", col)
+        arts += ax_int.plot([q["x"] for q in gi], [q["y"] for q in gi], "--s", color=col, mfc="none",
+                            ms=4, lw=1.0, label="mean of %d sets, integral" % nsets)
+    h, l = ax1.get_legend_handles_labels()
+    if ax_int is not ax1 and ax_int.get_visible():
+        h2, l2 = ax_int.get_legend_handles_labels()
+        h, l = h + h2, l + l2
+    ax1.legend(h, l, fontsize=8, loc="best")
+    return arts
+
+
 def draw_latest(ax2, a):
     """Right-hand panel of plot.png: the latest spectrum with the window, or the start of
     the latest FID (ax2 None: nothing)."""
@@ -2021,7 +2473,10 @@ def draw(p, a, runpath):
     on = [r for r in res if r["kind"] == "ON" and r["y"] is not None]
 
     # Profile, one series per set; with show_i also the integral of the window
-    if on:
+    errm = a.get("error_bars", "none")
+    if on and errm == "repeats":                 # the mean over the sets, with its standard error
+        draw_profile_repeats(ax1, ax1 if a["use_enh"] else ax1b, a)
+    elif on:
         sets = sorted(set(r["set"] for r in on))
         for i, s in enumerate(sets):
             pts = sorted([r for r in on if r["set"] == s], key=lambda r: r["freq"])
@@ -2034,6 +2489,8 @@ def draw(p, a, runpath):
             ax1.plot([r["freq"] for r in pts], [r["y"] for r in pts], "-o",
                      color=SET_COLORS[i % len(SET_COLORS)], ms=5 if len(pts) < 150 else 3, lw=1.2,
                      label=label)
+            if errm == "noise":
+                error_bars(ax1, pts, "freq", "y", "ey", SET_COLORS[i % len(SET_COLORS)])
         latest = max(on, key=lambda r: r["expno"])
         ax1.plot([latest["freq"]], [latest["y"]], "o", color="#c0392b", ms=8, zorder=3)
         if show_i:
@@ -2048,6 +2505,8 @@ def draw(p, a, runpath):
                     target.plot([r["freq"] for r in pts], [r["yi"] for r in pts], "--s",
                                 color=SET_COLORS[i % len(SET_COLORS)], mfc="none", ms=4, lw=1.0,
                                 label=("set %d, integral" % s) if multi else "integral")
+                    if errm == "noise":
+                        error_bars(target, pts, "freq", "yi", "eyi", SET_COLORS[i % len(SET_COLORS)])
             if ion:
                 li = max(ion, key=lambda r: r["expno"])
                 target.plot([li["freq"]], [li["yi"]], "s", color="#c0392b", mfc="none", ms=8, zorder=3)
@@ -2127,6 +2586,8 @@ def draw(p, a, runpath):
             lines.append("%send OFF / start OFF = %.3f%s" % (pre, eo[0]["value"] / so["value"], extra))
     if a["off_mode"] in ("start", "both") and not a["use_enh"]:
         lines.append("start OFF not available: plotting intensity per scan")
+    if errm != "none":
+        lines.append(error_text(a, ascii_only=True))
     lines.extend(phase_status(a))
     bad = [r for r in res if r["kind"] == "ON" and r["value"] is None
            and not (fidm and r["fid"]["read"] and r["fid"]["g"] is None)]   # listed by fid_status
@@ -2180,23 +2641,23 @@ def fit_label(f, name, ascii_only=False):
 
 
 def plot_buildup(ax1, ax1b, a, ascii_only=False, ms=5):
-    """The build-up series of a with their fitted curves, on ax1; OFF on ax1b when ON and
-    OFF are both shown and not normalized. Returns (lines, sep, series, scales)."""
-    series = buildup_series(a["results"])
+    """The build-up series of a with their error bars (if any) and fitted curves, on ax1;
+    OFF on ax1b when ON and OFF are both shown and not normalized. Returns (artists, sep,
+    view, scales)."""
+    view = buildup_view(a["results"], a["error_bars"])
     fits, norm, multi = a["fits"], a["normalize"], a["multi_set"]
-    kinds = set(k for k, s in series)
+    kinds = set(k for k, s in view)
     sep = len(kinds) == 2 and not norm
-    allpts = [r for pts in series.values() for r in pts]
+    xs = [x for v in view.values() for x in v["x"]]
     tt = None
-    if allpts:
-        d1 = [r["d1"] for r in allpts]
+    if xs:
         if a["log_d1"]:
-            tt = np.exp(np.linspace(math.log(min(d1) / 2.0), math.log(max(d1) * 1.5), 300))
+            tt = np.exp(np.linspace(math.log(min(xs) / 2.0), math.log(max(xs) * 1.5), 300))
         else:
-            tt = np.linspace(0.0, max(d1) * 1.05, 300)
-    lines, scales, count = [], {}, {"ON": 0, "OFF": 0}
-    named = multi or len(kinds) > 1
-    for key, pts in series.items():
+            tt = np.linspace(0.0, max(xs) * 1.05, 300)
+    arts, scales, count = [], {}, {"ON": 0, "OFF": 0}
+    named = multi or len(kinds) > 1 or a["error_bars"] == "repeats"
+    for key, v in view.items():
         kind = key[0]
         col, mk, mfc = buildup_style(kind, count[kind])
         count[kind] += 1
@@ -2210,20 +2671,36 @@ def plot_buildup(ax1, ax1b, a, ascii_only=False, ms=5):
             scale = 1.0 / f["s_inf"]
         scales[key] = scale
         name = series_name(key, multi)
-        lines += ax.plot([r["d1"] for r in pts], [r["y"] * scale for r in pts], ls="none", marker=mk,
-                         color=col, mfc=mfc, ms=ms, label=name, zorder=3)
+        withe = [(x, y, e) for x, y, e in zip(v["x"], v["y"], v["e"]) if e is not None]
+        if withe:
+            c = ax.errorbar([q[0] for q in withe], [q[1] * scale for q in withe],
+                            yerr=[q[2] * scale for q in withe], fmt="none", ecolor=col,
+                            elinewidth=0.9, capsize=2.5, zorder=2.5)
+            arts += [c.lines[0]] if c.lines[0] is not None else []
+            arts += list(c.lines[1]) + list(c.lines[2])
+        arts += ax.plot(v["x"], [y * scale for y in v["y"]], ls="none", marker=mk,
+                        color=col, mfc=mfc, ms=ms, label=name, zorder=3)
         if ok:
             lab = fit_label(f, name if named else None, ascii_only)
             if not f["determined"]:
                 lab = ("%s fit: not determined" % name) if named else "fit: not determined"
-            lines += ax.plot(tt, fit_model_value(f["model"], f["p"], tt) * scale,
-                             "-" if f["determined"] else "--", color=col, lw=1.1, label=lab, zorder=2)
-    return lines, sep, series, scales
+            arts += ax.plot(tt, fit_model_value(f["model"], f["p"], tt) * scale,
+                            "-" if f["determined"] else "--", color=col, lw=1.1, label=lab, zorder=2)
+    return arts, sep, view, scales
 
 
-def buildup_xlim(ax1, a, series):
+def view_point(view, rec):
+    """(key, index) of the point of the view that holds the record, or None."""
+    for key, v in view.items():
+        for i, rs in enumerate(v["recs"]):
+            if any(r["expno"] == rec["expno"] for r in rs):
+                return key, i
+    return None
+
+
+def buildup_xlim(ax1, a, view):
     """Linear D1 axis from 0, or a log axis around the D1 values."""
-    d1 = [r["d1"] for pts in series.values() for r in pts]
+    d1 = [x for v in view.values() for x in v["x"]]
     if a["log_d1"] and d1:
         ax1.set_xscale("log")
         ax1.set_xlim(min(d1) / 2.2, max(d1) * 1.6)
@@ -2233,7 +2710,7 @@ def buildup_xlim(ax1, a, series):
         ax1.set_xlim(0.0, max(d1) * 1.07)
 
 
-def buildup_ylabels(ax1, ax1b, a, series, sep, ascii_only=False):
+def buildup_ylabels(ax1, ax1b, a, view, sep, ascii_only=False):
     unit = "FID(t0) / (NS*RG)" if a["fid_mode"] else "intensity per scan"
     if a["normalize"]:
         ax1.set_ylabel("S / S_inf (fitted)" if ascii_only else "S / S∞ (fitted)")
@@ -2241,7 +2718,7 @@ def buildup_ylabels(ax1, ax1b, a, series, sep, ascii_only=False):
         ax1.set_ylabel("ON: " + unit, color=SET_COLORS[0])
         ax1b.set_ylabel("OFF: " + unit, color=OFF_COLORS[0])
     else:
-        kinds = sorted(set(k for k, s in series))
+        kinds = sorted(set(k for k, s in view))
         ax1.set_ylabel(unit + (" (%s)" % kinds[0] if len(kinds) == 1 else ""))
 
 
@@ -2263,14 +2740,15 @@ def draw_buildup(p, a, runpath):
     if ax3 is not None:
         ax3.clear()
     res, multi = a["results"], a["multi_set"]
-    lines, sep, series, scales = plot_buildup(ax1, ax1b, a)
-    allpts = [r for key, pts in series.items() if key in scales for r in pts]
+    lines, sep, view, scales = plot_buildup(ax1, ax1b, a)
+    allpts = [r for key, v in view.items() if key in scales for rs in v["recs"] for r in rs]
     if allpts:
         if sep:
             ax1b.set_visible(True)
         r = max(allpts, key=lambda q: q["expno"])
-        ax = ax1b if (sep and r["kind"] == "OFF") else ax1
-        ax.plot([r["d1"]], [r["y"] * scales[(r["kind"], r["set"])]], "o", color="#c0392b", ms=8,
+        key, i = view_point(view, r)
+        ax = ax1b if (sep and key[0] == "OFF") else ax1
+        ax.plot([view[key]["x"][i]], [view[key]["y"][i] * scales[key]], "o", color="#c0392b", ms=8,
                 mfc="none", mew=1.8, zorder=4)
         h, l = ax1.get_legend_handles_labels()
         if sep:
@@ -2278,12 +2756,12 @@ def draw_buildup(p, a, runpath):
             h, l = h + h2, l + l2
         ax1.legend(h, l, fontsize=8, loc="best")
     else:
-        ax1.text(0.5, 0.5, "waiting for the first record" if not series else
+        ax1.text(0.5, 0.5, "waiting for the first record" if not view else
                  "no fit to normalize to (see the lines above)", transform=ax1.transAxes,
                  ha="center", va="center", color="0.4")
-    buildup_ylabels(ax1, ax1b, a, series, sep)
+    buildup_ylabels(ax1, ax1b, a, view, sep)
     ax1.axhline(0.0, color="0.6", lw=0.8)
-    buildup_xlim(ax1, a, series)
+    buildup_xlim(ax1, a, view)
     if ax3 is not None:
         on = [r for r in res if r["d1"] is not None and r["fid"] and r["fid"]["phase_rel"] is not None]
         count = {"ON": 0, "OFF": 0}
@@ -2316,8 +2794,10 @@ def draw_buildup(p, a, runpath):
     if p.compact:                            # the window: fit results above the plot, no title
         p.fit_layout()
         return
-    lines = ["fit: %s, %s (weighted by NS; +/- one standard error)"
-             % (FIT_MODELS[a["fit_model"]], FIT_FORMULAS[a["fit_model"]])]
+    lines = ["fit: %s, %s (%s; +/- one standard error)"
+             % (FIT_MODELS[a["fit_model"]], FIT_FORMULAS[a["fit_model"]], fit_weight_text(a, True))]
+    if a["error_bars"] != "none":
+        lines.append(error_text(a, ascii_only=True))
     for key, f in a["fits"].items():
         name = series_name(key, multi)
         lines.append("%s: %s" % (name, ("no fit: " + f["error"]) if "error" in f
@@ -2327,7 +2807,7 @@ def draw_buildup(p, a, runpath):
                       f["notes"] + ([] if f["determined"] else ["not determined: " + f["why"]])]
     for s, r1, r2 in fit_ratios(a):
         lines.append("ON/OFF%s: S_inf ratio %s; max S/sqrt(t) ratio %s"
-                     % (" set %d" % s if multi else "", "-" if r1 is None else "%.4g" % r1,
+                     % (" set %d" % s if (multi and s) else "", "-" if r1 is None else "%.4g" % r1,
                         "-" if r2 is None else "%.4g" % r2))
     lines.extend(phase_status(a))
     bad = [r for r in res if r["value"] is None
@@ -2431,17 +2911,25 @@ def write_profile_eps(path, a, aspect=None):
             ax1, ax3 = fig.add_subplot(111), None
         ax_i = ax1.twinx() if show_i and not a["use_enh"] else ax1
         lines = []
-        for i, s in enumerate(sorted(set(r["set"] for r in on))):
+        errm = a.get("error_bars", "none")
+        if errm == "repeats":
+            lines += draw_profile_repeats(ax1, ax_i, a, ms=4, lw=1.0, latest=False)
+            ax1.get_legend().remove()
+        for i, s in enumerate(sorted(set(r["set"] for r in on)) if errm != "repeats" else []):
             col = SET_COLORS[i % len(SET_COLORS)]
             pts = sorted([r for r in on if r["set"] == s], key=lambda r: r["freq"])
             name = ("FID(t0)" if fidm else "peak") if show_i else None
             label = (("set %d, %s" % (s, name)) if name else ("set %d" % s)) if multi else name
             lines += ax1.plot([r["freq"] for r in pts], [r["y"] for r in pts], "-o", color=col,
                               ms=4, lw=1.0, label=label)
+            if errm == "noise":
+                lines += error_bars(ax1, pts, "freq", "y", "ey", col, lw=0.8)
             if show_i:
                 ip = [r for r in pts if r.get("yi") is not None]
                 lines += ax_i.plot([r["freq"] for r in ip], [r["yi"] for r in ip], "--s", color=col, mfc="none",
                                    ms=4, lw=0.8, label=("set %d, integral" % s) if multi else "integral")
+                if errm == "noise":
+                    lines += error_bars(ax_i, ip, "freq", "yi", "eyi", col, lw=0.8)
             if ax3 is not None:
                 pp = [r for r in pts if r["fid"] and r["fid"]["phase_rel"] is not None]
                 lines += ax3.plot([r["freq"] for r in pp], [r["fid"]["phase_rel"] for r in pp], "-o",
@@ -2453,7 +2941,7 @@ def write_profile_eps(path, a, aspect=None):
             ax1.set_ylabel("FID(t0) / (NS*RG) (a.u.)" if fidm else "intensity per scan (a.u.)")
         if ax_i is not ax1:
             ax_i.set_ylabel("integral per scan (a.u. x ppm)")
-        if multi or show_i:
+        if multi or show_i or errm == "repeats":
             h, l = ax1.get_legend_handles_labels()
             if ax_i is not ax1:
                 h2, l2 = ax_i.get_legend_handles_labels()
@@ -2510,20 +2998,20 @@ def write_buildup_eps(path, a, aspect=None):
         else:
             ax1, ax3 = fig.add_subplot(111), None
         ax1b = ax1.twinx()
-        lines, sep, series, scales = plot_buildup(ax1, ax1b, a, ascii_only=True, ms=4)
+        lines, sep, view, scales = plot_buildup(ax1, ax1b, a, ascii_only=True, ms=4)
         if not sep:
             fig.delaxes(ax1b)
-        buildup_ylabels(ax1, ax1b, a, series, sep, ascii_only=True)
+        buildup_ylabels(ax1, ax1b, a, view, sep, ascii_only=True)
         lines.append(ax1.axhline(0.0, color="0.6", lw=0.6, zorder=0))
         h_, l_ = ax1.get_legend_handles_labels()
         if sep:
             h2, l2 = ax1b.get_legend_handles_labels()
             h_, l_ = h_ + h2, l_ + l2
         ax1.legend(h_, l_, fontsize=8, frameon=False, loc="best")
-        buildup_xlim(ax1, a, series)
+        buildup_xlim(ax1, a, view)
         if ax3 is not None:
             count = {"ON": 0, "OFF": 0}
-            for key in series:
+            for key in buildup_series(a["results"]):
                 col, mk, mfc = buildup_style(key[0], count[key[0]])
                 count[key[0]] += 1
                 pp = sorted([r for r in pts if (r["kind"], r["set"]) == key], key=lambda q: q["d1"])
@@ -2763,7 +3251,7 @@ class MainWindow:
         bar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(4, 2))
         self.bar = bar
         ttk.Label(bar, text="Reopen:").pack(side=tk.LEFT, padx=(4, 4))
-        self.reopen_entry = ttk.Entry(bar)
+        self.reopen_entry = ttk.Entry(bar, width=12)     # grows with the window
         self.reopen_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.reopen_entry.insert(0, reopen)
         self.reopen_entry.configure(state="readonly")
@@ -2779,7 +3267,7 @@ class MainWindow:
         if self.buildup:                         # fit model and axes of the build-up
             ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
             ttk.Label(bar, text="Fit:").pack(side=tk.LEFT)
-            self.fit_combo = ttk.Combobox(bar, state="readonly", width=24, values=list(FIT_MODELS.values()))
+            self.fit_combo = ttk.Combobox(bar, state="readonly", width=10, values=[FIT_SHORT[k] for k in FIT_MODELS])
             self.fit_combo.pack(side=tk.LEFT, padx=(6, 0))
             self.fit_combo.current(0)
             self.fit_combo.bind("<<ComboboxSelected>>", self.on_fit_model)
@@ -2789,6 +3277,12 @@ class MainWindow:
             self.norm_var = tk.IntVar(value=0)
             ttk.Checkbutton(bar, text="normalized", variable=self.norm_var,
                             command=self.on_buildup_axes).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
+        ttk.Label(bar, text="Error bars:").pack(side=tk.LEFT)
+        self.err_combo = ttk.Combobox(bar, state="readonly", width=10, values=list(ERROR_MODES.values()))
+        self.err_combo.pack(side=tk.LEFT, padx=(6, 0))
+        self.err_combo.current(0)
+        self.err_combo.bind("<<ComboboxSelected>>", self.on_error_mode)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Label(bar, text="Export:").pack(side=tk.LEFT)
         ttk.Button(bar, text="Build-up EPS" if self.buildup else "Profile EPS",
@@ -2800,6 +3294,27 @@ class MainWindow:
         self.msg = tk.StringVar(value="")
         self.msg_label = ttk.Label(self.root, textvariable=self.msg, foreground=ERROR_FG)
         self.msg_shown = False
+
+        # Error bars: a row below the bar while they are shown
+        er = ttk.Frame(self.root)
+        self.errrow, self.errrow_shown = er, False
+        self.err_text = ttk.Label(er, text="")
+        self.err_text.pack(side=tk.LEFT, padx=(8, 8))
+        self.noise_box = ttk.Frame(er)
+        ttk.Label(self.noise_box, text="noise from").pack(side=tk.LEFT)
+        self.noise_from = ttk.Entry(self.noise_box, width=7)
+        self.noise_from.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(self.noise_box, text="to").pack(side=tk.LEFT, padx=(4, 0))
+        self.noise_to = ttk.Entry(self.noise_box, width=7)
+        self.noise_to.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(self.noise_box, text="ppm (empty: outside the intensity window, peaks excluded)",
+                  foreground=HINT_FG).pack(side=tk.LEFT, padx=(4, 0))
+        for e in (self.noise_from, self.noise_to):
+            for ev in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+                e.bind(ev, lambda event: self.on_noise_region())
+        self.fitsig_var = tk.IntVar(value=0)
+        self.fitsig_cb = ttk.Checkbutton(er, text="weight the fits by 1/σ²", variable=self.fitsig_var,
+                                         command=self.on_fit_sigma)
 
         # Bottom: the controls of the spectrum side (packed before the plots, so that they
         # keep their height when the window is made smaller)
@@ -2976,6 +3491,16 @@ class MainWindow:
             self.update_records(a)
             self.int_var.set(1 if self.analyzer.phase.get("show_integral") else 0)
             self.fph_var.set(1 if self.analyzer.phase.get("show_fid_phase") else 0)
+            ph = self.analyzer.phase
+            self.err_combo.current(list(ERROR_MODES).index(ph.get("error_bars", "none")))
+            self.fitsig_var.set(1 if ph.get("fit_sigma") else 0)
+            focus = self.root.focus_get()
+            for e, k in ((self.noise_from, "noise_from"), (self.noise_to, "noise_to")):
+                if e is not focus:
+                    e.delete(0, tk.END)
+                    if ph.get(k) is not None:
+                        e.insert(0, "%g" % ph[k])
+            self.update_errrow()
             if self.buildup:
                 ph = self.analyzer.phase
                 self.fit_combo.current(list(FIT_MODELS).index(ph.get("fit_model", "mono")))
@@ -3091,6 +3616,18 @@ class MainWindow:
             return
         if a["buildup"]:
             return self.on_click_buildup(event)
+        if a["error_bars"] == "repeats" and event.inaxes in (p.ax1, p.ax1b):
+            g, gi = profile_means(a)
+            best, dmin = None, 30.0
+            for groups, ax in ((g, p.ax1), (gi, p.ax1 if a["use_enh"] else p.ax1b)):
+                for q in groups:
+                    xp, yp = ax.transData.transform((q["x"], q["y"]))
+                    d = math.hypot(xp - event.x, yp - event.y)
+                    if d < dmin:
+                        best, dmin = max(q["recs"], key=lambda r: r["expno"]), d
+            if best is not None and not self.show_record(best["expno"]):
+                self.set_msg("expno %d has no processed spectrum to show" % best["expno"])
+            return
         if event.inaxes in (p.ax1, p.ax1b):
             targets = [(p.ax1, "y")]
             if a["show_integral"]:
@@ -3124,29 +3661,89 @@ class MainWindow:
         a, p = self.last_a, self.p
         if event.inaxes not in (p.ax1, p.ax1b) and not (p.ax3 is not None and event.inaxes is p.ax3):
             return
-        series = buildup_series(a["results"])
-        sep = len(set(k for k, s in series)) == 2 and not a["normalize"]
         best, dmin = None, 30.0                # pixels
-        for key, pts in series.items():
-            f = a["fits"].get(key)
-            scale = 1.0
-            if a["normalize"]:
-                if f is None or "error" in f or not f["s_inf"]:
+        if p.ax3 is not None and event.inaxes is p.ax3:
+            for r in a["results"]:
+                y = (r["fid"] or {}).get("phase_rel")
+                if y is None or r["d1"] is None:
                     continue
-                scale = 1.0 / f["s_inf"]
-            for r in pts:
-                if p.ax3 is not None and event.inaxes is p.ax3:
-                    ax, y = p.ax3, (r["fid"] or {}).get("phase_rel")
-                else:
-                    ax, y = (p.ax1b if sep and key[0] == "OFF" else p.ax1), r["y"] * scale
-                if y is None:
-                    continue
-                xp, yp = ax.transData.transform((r["d1"], y))
+                xp, yp = p.ax3.transData.transform((r["d1"], y))
                 d = math.hypot(xp - event.x, yp - event.y)
                 if d < dmin:
                     best, dmin = r, d
+        else:
+            view = buildup_view(a["results"], a["error_bars"])
+            sep = len(set(k for k, s in view)) == 2 and not a["normalize"]
+            for key, v in view.items():
+                f = a["fits"].get(key)
+                scale = 1.0
+                if a["normalize"]:
+                    if f is None or "error" in f or not f["determined"] or not f["s_inf"]:
+                        continue
+                    scale = 1.0 / f["s_inf"]
+                ax = p.ax1b if sep and key[0] == "OFF" else p.ax1
+                for x, y, rs in zip(v["x"], v["y"], v["recs"]):
+                    xp, yp = ax.transData.transform((x, y * scale))
+                    d = math.hypot(xp - event.x, yp - event.y)
+                    if d < dmin:          # a mean of repeats: its latest record
+                        best, dmin = max(rs, key=lambda q: q["expno"]), d
         if best is not None and not self.show_record(best["expno"]):
             self.set_msg("expno %d has no processed spectrum to show" % best["expno"])
+
+    def update_errrow(self):
+        """Shows the error-bar row (and its noise and fit-weight settings) while error bars are on."""
+        ph = self.analyzer.phase
+        em = ph.get("error_bars", "none")
+        if em == "none":
+            if self.errrow_shown:
+                self.errrow.pack_forget()
+                self.errrow_shown = False
+            return
+        if em == "noise":
+            self.err_text.configure(text="±1σ from the noise floor of each record (FID(t0): of each fid):")
+            self.noise_box.pack(side=tk.LEFT, after=self.err_text)
+        else:
+            self.err_text.configure(text="mean ± standard error over the records at the same %s "
+                                         "(sets, or a repeated D1)" % ("D1" if self.buildup else "frequency"))
+            self.noise_box.pack_forget()
+        if self.buildup:
+            self.fitsig_cb.pack(side=tk.LEFT, padx=(16, 0))
+        if not self.errrow_shown:
+            self.errrow.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 2), after=self.bar)
+            self.errrow_shown = True
+
+    def on_error_mode(self, event=None):
+        mode = list(ERROR_MODES)[max(0, self.err_combo.current())]
+        self.set_msg(self.analyzer.set_display(error_bars=mode))
+        self.update_errrow()
+        self.refresh(reschedule=False)
+        self.spec.redraw()
+
+    def on_noise_region(self):
+        vals = []
+        for e in (self.noise_from, self.noise_to):
+            t = e.get().strip()
+            try:
+                vals.append(float(t) if t else None)
+            except ValueError:
+                self.set_msg("noise region: '%s' is not a number (ppm)" % t)
+                return
+        if (vals[0] is None) != (vals[1] is None):
+            self.set_msg("noise region: give both ends (ppm), or leave both empty for the automatic region")
+            return
+        if vals[0] is not None and vals[0] == vals[1]:
+            self.set_msg("noise region: the two ends are the same")
+            return
+        ph = self.analyzer.phase
+        if (ph.get("noise_from"), ph.get("noise_to")) == tuple(vals):
+            return
+        self.set_msg(self.analyzer.set_display(noise_from=vals[0], noise_to=vals[1]))
+        self.refresh(reschedule=False)
+        self.spec.redraw()
+
+    def on_fit_sigma(self):
+        self.set_msg(self.analyzer.set_display(fit_sigma=bool(self.fitsig_var.get())))
+        self.refresh(reschedule=False)
 
     def on_fit_model(self, event=None):
         model = list(FIT_MODELS)[max(0, self.fit_combo.current())]
@@ -3217,6 +3814,7 @@ class SpectrumPane:
         self.note = ""
         self.what = ""
         self.span = None            # shading of the trial window
+        self.nspan = None           # shading of the noise region (error bars)
         self.drag = None            # right-button drag: [x0, x1, patch]
         self.fid_shown = False      # the FID(t0) row is packed
         self.trial = None           # from the applied settings at the first refresh
@@ -3553,6 +4151,17 @@ class SpectrumPane:
         c, w = self.trial["center"], self.trial["width"]
         if c is not None:
             self.span = self.ax.axvspan(c - w / 2.0, c + w / 2.0, color="#1f5fa8", alpha=0.12, zorder=0)
+        if self.nspan is not None:
+            try:
+                self.nspan.remove()
+            except Exception:
+                pass
+            self.nspan = None
+        ph = self.main.analyzer.phase
+        if ph.get("error_bars") == "noise" and ph.get("noise_from") is not None \
+                and ph.get("noise_to") is not None and self.drawn == "spectrum":
+            self.nspan = self.ax.axvspan(ph["noise_from"], ph["noise_to"], color="#7f8c8d", alpha=0.18,
+                                         zorder=0)
 
     def fid_text(self):
         """FID(t0) and the FID phase of the record shown, with the trial N and method."""
@@ -3617,6 +4226,13 @@ class SpectrumPane:
             settings += " · %s · %s" % ("baseline order %d" % tr["order"] if tr["baseline"] else "no baseline",
                                         window_desc(tr["center"], tr["width"]).replace("+/-", "±"))
         self.ax.set_title("")
+        a = self.main.last_a
+        if a is not None and a.get("error_bars") == "noise" and self.row is not None:
+            r = [q for q in a["results"] if q["expno"] == self.row["expno"]]
+            if r and r[0].get("err") is not None:
+                val_txt += " · σ %.3g (noise, applied settings)" % r[0]["err"]
+            elif r and r[0].get("err_note"):
+                val_txt += " · %s" % r[0]["err_note"]
         self.info.set([("Value", val_txt, False), ("Settings", settings, False)])
         self.update_status(notes)
         if fit:

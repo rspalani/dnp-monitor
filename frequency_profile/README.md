@@ -236,6 +236,34 @@ axis on the right.
   the next record is overdue, so a long record late in the run is not reported
   as a problem.
 
+### Error bars
+
+"Error bars" in the top bar adds error bars to the profile or the build-up, in
+the window, `plot.png`, the EPS export, `values.tsv`, and `records.csv`. With
+error bars off, everything is as before.
+
+- **noise floor**: ±1σ of each record from the noise of its own spectrum. By
+  default the noise is measured on the points outside the intensity window,
+  with peaks (spinning sidebands, other lines) and a smooth baseline left out;
+  a signal-free range can be typed instead in the row that appears below the
+  top bar ("noise from … to … ppm"; shaded grey in the spectrum). The σ of
+  `sum` and of the window integral includes the correlation between
+  neighbouring points (zero filling, apodization). For `extreme` and `max` it
+  is the noise of one point, which is an upper bound: the maximum of a
+  well-digitized peak top scatters somewhat less. For `FID(t0)` it comes from
+  the noise in the last quarter of the fid. For I_on/I_off − 1 the σ of the
+  start OFF is included. The spectrum pane shows the σ of the record shown.
+- **repeats**: the mean of the records at the same frequency (profile) or D1
+  (build-up, ON and OFF separately), over the sets of a run with `REPEATS` > 1
+  or a D1 that appears more than once, ± its standard error. The sets are then
+  shown as one series. A point measured once has no bar.
+- For build-ups, "weight the fits by 1/σ²" (in the same row) fits with these
+  errors instead of NS and takes the parameter errors from them; the fit row
+  then shows χ²/dof, which is about 1 when the noise explains the scatter, and
+  a note when the scatter is clearly larger. With repeats, this needs at least
+  3 records at every D1 (the standard error of 2 records is too rough to weight
+  by); otherwise the fit stays weighted by NS and says so.
+
 ## Phasing the TopSpin data after a run
 
 Set the phase in the viewer and press "Apply to all records"; this writes
