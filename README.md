@@ -133,9 +133,11 @@ Only one copy runs at a time (a lock file in the base folder).
   everything is fine; the monitor ignores it and flags only real faults (e.g.
   spin-rate cable disconnected).
 - **Compact view**: button at the top left. Replaces the full window with a small one
-  showing only the readout boxes (spin rate and pressures of each MAS3, bearing and drive
-  temperatures, LN2 level), kept on top of other windows unless unticked. *Full monitor*
-  (or closing the small window) brings the full window back; logging carries on either way.
+  (about 370 x 270 px) with one row per reading: each MAS3's spin rate with its bearing and
+  drive pressures (or its fault), the bearing and drive temperatures with the heater range,
+  and the LN2 level with its fill state or alarm. It stays on top of other windows unless
+  *on top* is unticked. *Full monitor* (or closing the small window) brings the full window
+  back; logging carries on either way.
 - **Dark mode**: checkbox at the top left (shared setting with the viewer,
   stored in `~/.dnp_monitor_theme`).
 
