@@ -31,6 +31,8 @@ A companion **log viewer** plots any time range of the saved logs.
 | `dnp_monitor.py` | The monitor (one window, runs all the time) |
 | `dnp_logviewer.py` | The log viewer (separate window; opened from the monitor's top bar or on its own) |
 | `dnp_monitor.conf.example` | Example configuration, with placeholder addresses |
+| `launch/dnp_monitor` | The command `dnp_monitor` that starts the monitor (installed in `/usr/local/bin`) |
+| `launch/dnp_monitor.desktop` | Desktop icon that runs the same command |
 
 ### Requirements
 
@@ -43,37 +45,62 @@ No other packages are needed; the instruments are reached with the standard libr
 
 ### Installation
 
-Everything lives in one folder, by default `/home/nmrsu/dnp_monitor`
-(`BASE_DIR` in both programs, or `--base-dir`). Logs are written into
-sub-folders of it.
+The monitor uses three places on the Topspin PC:
 
-**New installation**
+| Folder | What is there |
+|---|---|
+| `/home/nmrsu/src/dnp-tools` | A clone of this repository, used only to download updates; nothing is run from it |
+| `/opt/dnptools/dnp_monitor/` | The installed programs, `dnp_monitor.py` and `dnp_logviewer.py` |
+| `/home/nmrsu/dnp_monitor/` | `dnp_monitor.conf` and the logs |
 
-```bash
-git clone https://github.com/rspalani/dnp-tools.git /home/nmrsu/dnp_monitor
-cd /home/nmrsu/dnp_monitor
-cp dnp_monitor.conf.example dnp_monitor.conf
-chmod 600 dnp_monitor.conf
-# edit dnp_monitor.conf: the instruments' real addresses
-python3 dnp_monitor.py
-```
+The programs find the configuration and the logs through `BASE_DIR`
+(`/home/nmrsu/dnp_monitor` in both programs, or `--base-dir`), wherever the
+programs themselves are installed.
 
-**Folder that already has the programs, config, and logs** (e.g. the current
-Topspin PC): the config and logs are ignored by git, so the folder can be turned
-into a clone without touching them.
+**New installation** (as nmrsu; `sudo` for `/opt` and `/usr/local/bin`)
 
 ```bash
-cd /home/nmrsu/dnp_monitor
-git init
-git remote add origin https://github.com/rspalani/dnp-tools.git
-git fetch origin
-git checkout -f -b main origin/main     # replaces only the programs (and adds frequency_profile/)
+mkdir -p /home/nmrsu/src
+git clone https://github.com/rspalani/dnp-tools.git /home/nmrsu/src/dnp-tools
+cd /home/nmrsu/src/dnp-tools
+
+# the programs
+sudo mkdir -p /opt/dnptools/dnp_monitor
+sudo cp dnp_monitor.py dnp_logviewer.py /opt/dnptools/dnp_monitor/
+sudo chmod a+r /opt/dnptools/dnp_monitor/*.py
+
+# the command dnp_monitor, and the desktop icon
+sudo install -m 755 launch/dnp_monitor /usr/local/bin/dnp_monitor
+cp launch/dnp_monitor.desktop ~/Desktop/
+chmod +x ~/Desktop/dnp_monitor.desktop
+
+# the configuration, once
+mkdir -p /home/nmrsu/dnp_monitor
+cp -n dnp_monitor.conf.example /home/nmrsu/dnp_monitor/dnp_monitor.conf
+chmod 600 /home/nmrsu/dnp_monitor/dnp_monitor.conf
+# edit /home/nmrsu/dnp_monitor/dnp_monitor.conf: the instruments' real addresses
 ```
 
-**Updating later**: close the monitor, then `git pull` in that folder, and start it again.
-A clone made when the repository was still called `dnp-monitor` keeps working (GitHub
-redirects the old address); `git remote set-url origin https://github.com/rspalani/dnp-tools.git`
-in that folder makes it use the new name.
+The first double-click on the desktop icon may ask for one confirmation (KDE asks
+whether to trust the file; in GNOME, right-click it and choose *Allow Launching*).
+If the icon appears blank, the icon theme lacks `utilities-system-monitor`: change
+`Icon=` in the file to another icon name or to the path of a PNG. Each account that
+logs in needs the file on its own desktop; `sudo cp launch/dnp_monitor.desktop
+/usr/share/applications/` also adds it to the application menu of every account.
+
+**Updating**
+
+```bash
+cd /home/nmrsu/src/dnp-tools && git pull
+# close the monitor (its window), then:
+sudo cp dnp_monitor.py dnp_logviewer.py /opt/dnptools/dnp_monitor/
+dnp_monitor
+```
+
+Copy the files out of the clone; do not move them. git counts a moved file as a
+local deletion, and the next `git pull` stops when that file has changed on GitHub.
+The frequency-profile tools are installed and updated from the same clone; see
+[frequency_profile/README.md](frequency_profile/README.md).
 
 ### Configuration
 
@@ -92,11 +119,16 @@ The real file stays only on the instrument PC (it is in `.gitignore`).
 
 ### Using the monitor
 
+Start it with the desktop icon, or by typing `dnp_monitor` in a terminal. Both run
+
 ```bash
-python3 /home/nmrsu/dnp_monitor/dnp_monitor.py
+nohup python3 /opt/dnptools/dnp_monitor/dnp_monitor.py >>/home/nmrsu/dnp_monitor/launcher.log 2>&1 &
 ```
 
-Only one copy runs at a time (a lock file in the base folder).
+so the monitor keeps running when the terminal is closed (a program started with a
+plain `&` ends with its terminal), and its messages are kept in `launcher.log`.
+Only one copy runs at a time (a lock file in the base folder); a second start
+shows a message instead.
 
 - **Plots**: past 24 h and past 30 min. The toolbar zooms and pans; *Follow live*
   switches back on by itself 30 s after the last zoom or pan. Under the Lake Shore
@@ -146,7 +178,7 @@ Only one copy runs at a time (a lock file in the base folder).
 Open it with the button at the top of the monitor, or on its own:
 
 ```bash
-python3 /home/nmrsu/dnp_monitor/dnp_logviewer.py [--start "2026-11-01 08:00" --stop "2026-11-02 08:00"]
+python3 /opt/dnptools/dnp_monitor/dnp_logviewer.py [--start "2026-11-01 08:00" --stop "2026-11-02 08:00"]
 ```
 
 - One panel per instrument, with small stacked subplots per unit and one shared
@@ -180,7 +212,7 @@ noted in `housekeeping.log`. Read a gzipped log with `zcat`, or
 The programs were written with Claude, and further changes can be made the same
 way: open this repository in Claude Code (or a Claude session with the
 repository attached), describe the change, and have it commit and push. Then
-`git pull` on the Topspin PC and restart the monitor.
+update the Topspin PC as described under Installation (pull, copy, restart).
 
 Points worth keeping when changing things:
 

@@ -37,11 +37,11 @@ so that TopSpin always runs the current version without being restarted).
 
 ## Installation and updates
 
-From a clone of this repository (e.g. the one in `/home/nmrsu/dnp_monitor`
-described in the main README):
+From the clone of this repository in `/home/nmrsu/src/dnp-tools` (see the main
+README):
 
 ```bash
-cd /home/nmrsu/dnp_monitor && git pull
+cd /home/nmrsu/src/dnp-tools && git pull
 cd frequency_profile
 
 # programs (-n: an existing awg_cmd.py, with the real address, is kept)
