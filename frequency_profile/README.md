@@ -335,8 +335,8 @@ with its fitted curve.
   "Export: Decay EPS" writes `decay.eps`, `values.tsv` has t and the fitted
   value of each record, and `records.csv` has `d1_s`, `t_s`, and `target_s`.
 - With `extreme` or `max`, weak points are biased upward by noise (the largest
-  of many noisy points); for a tail near the noise level, `sum` or FID(t0) is
-  unbiased.
+  of many noisy points); for a tail near the noise level, `sum` or FID(t0)
+  avoids this bias.
 
 ### Error bars
 
