@@ -1,0 +1,7 @@
+#!/bin/sh
+# dnp_monitor - start the DNP monitor; installed as /usr/local/bin/dnp_monitor.
+# The monitor runs in the background, detached from the terminal, so closing the
+# terminal does not stop it. Its messages go to launcher.log in the log folder.
+# If a monitor is already running, the new one shows a message and exits.
+LOG_DIR=/home/nmrsu/dnp_monitor
+nohup python3 /opt/dnptools/dnp_monitor/dnp_monitor.py "$@" >>"$LOG_DIR/launcher.log" 2>&1 &

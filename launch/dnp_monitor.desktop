@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DNP monitor
+Comment=MAS, temperature, and LN2 monitor of the 800 MHz DNP spectrometer
+Exec=/usr/local/bin/dnp_monitor
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Science;
