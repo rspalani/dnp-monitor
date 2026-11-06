@@ -1,4 +1,14 @@
-# DNP monitor
+# DNP tools
+
+Programs for the 800 MHz DNP spectrometer of the Griffin group (MIT, Francis
+Bitter Magnet Laboratory):
+
+| Part | What it is |
+|---|---|
+| [DNP monitor](#dnp-monitor) (`dnp_monitor.py`, `dnp_logviewer.py`) | MAS, temperature, and LN2 monitoring and logging; described below |
+| [`frequency_profile/`](frequency_profile/) | DNP frequency profiles: TopSpin acquisition scripts that step the mm-wave frequency, a live viewer, and post-run phasing; see [its README](frequency_profile/README.md) |
+
+## DNP monitor
 
 A monitoring and logging program for a Bruker DNP spectrometer, written for the
 800 MHz system in the Griffin group (MIT, Francis Bitter Magnet Laboratory). It
@@ -22,7 +32,7 @@ A companion **log viewer** plots any time range of the saved logs.
 | `dnp_logviewer.py` | The log viewer (separate window; opened from the monitor's top bar or on its own) |
 | `dnp_monitor.conf.example` | Example configuration, with placeholder addresses |
 
-## Requirements
+### Requirements
 
 - Linux with an X display (developed for openSUSE Leap 15.1 on the Topspin PC)
 - Python 3.6 or newer, with `numpy`, `matplotlib` (3.3 or newer), and `tkinter`
@@ -31,7 +41,7 @@ A companion **log viewer** plots any time range of the saved logs.
 
 No other packages are needed; the instruments are reached with the standard library.
 
-## Installation
+### Installation
 
 Everything lives in one folder, by default `/home/nmrsu/dnp_monitor`
 (`BASE_DIR` in both programs, or `--base-dir`). Logs are written into
@@ -57,12 +67,12 @@ cd /home/nmrsu/dnp_monitor
 git init
 git remote add origin https://github.com/rspalani/dnp-monitor.git
 git fetch origin
-git checkout -f -b main origin/main     # replaces only the two .py files
+git checkout -f -b main origin/main     # replaces only the programs (and adds frequency_profile/)
 ```
 
 **Updating later**: close the monitor, then `git pull` in that folder, and start it again.
 
-## Configuration
+### Configuration
 
 `dnp_monitor.conf` is read once at start-up (restart after editing). If it is
 missing, the monitor writes one with the placeholder addresses. Sections:
@@ -77,7 +87,7 @@ missing, the monitor writes one with the placeholder addresses. Sections:
 
 The real file stays only on the instrument PC (it is in `.gitignore`).
 
-## Using the monitor
+### Using the monitor
 
 ```bash
 python3 /home/nmrsu/dnp_monitor/dnp_monitor.py
@@ -122,7 +132,7 @@ Only one copy runs at a time (a lock file in the base folder).
 - **Dark mode**: checkbox at the top left (shared setting with the viewer,
   stored in `~/.dnp_monitor_theme`).
 
-## The log viewer
+### The log viewer
 
 Open it with the button at the top of the monitor, or on its own:
 
@@ -142,7 +152,7 @@ python3 /home/nmrsu/dnp_monitor/dnp_logviewer.py [--start "2026-11-01 08:00" --s
   time span on screen; files go to `exports/` in the base folder.
 - Read-only: it never changes the logs (including the gzipped ones).
 
-## Logs and housekeeping
+### Logs and housekeeping
 
 | Folder | Content | Rate |
 |---|---|---|
@@ -156,7 +166,7 @@ and deleted after 365 days (`COMPRESS_AFTER_DAYS`, `DELETE_AFTER_DAYS` in
 noted in `housekeeping.log`. Read a gzipped log with `zcat`, or
 `pandas.read_csv` directly.
 
-## Changing the code
+### Changing the code
 
 The programs were written with Claude, and further changes can be made the same
 way: open this repository in Claude Code (or a Claude session with the
