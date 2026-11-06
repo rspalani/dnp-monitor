@@ -2520,6 +2520,7 @@ class MasPanel:
 
         pressures = tk.Frame(readout, relief="groove", borderwidth=2, padx=8, bg="white")
         pressures.pack(side="left", fill="y", padx=(6, 0))
+        self.pressure_box = pressures
         self.pressure_labels = {}
         layout = ((0, "bearing_mbar", "Bearing (mbar)", (UI_FONT, 10), (UI_FONT, 22, "bold"), 6),
                   (1, "drive_mbar", "Drive (mbar)", (UI_FONT, 10), (UI_FONT, 22, "bold"), 6),
@@ -2735,6 +2736,7 @@ class AmiPanel:
         # Readout box (same row as the bearing and drive temperatures)
         box = tk.Frame(readouts, relief="groove", borderwidth=2, padx=8, pady=1, bg="white")
         box.grid(row=0, column=column, sticky="nsew", padx=(10, 0))
+        self.box = box
         tk.Label(box, text="LN2 level, every {:g} s".format(self.cfg["poll_seconds"]),
                  font=(UI_FONT, 11), bg="white").pack(anchor="e")
         self.big = tk.Label(box, text="---", anchor="e", font=(UI_FONT, 24, "bold"), fg=AMI_COLOR, bg="white", width=8)
@@ -3125,8 +3127,10 @@ class LakeShorePanel:
             readouts.columnconfigure(2, weight=2, uniform="readout")
         self.readouts = {}
         self.heater_badges = {}
+        self.readout_boxes = {}
         for column, (channel, name, color) in enumerate(CHANNELS):
             box = tk.Frame(readouts, relief="groove", borderwidth=2, padx=10, pady=1, bg="white")
+            self.readout_boxes[channel] = box
             box.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
             readouts.columnconfigure(column, weight=3, uniform="readout")
             title_row = tk.Frame(box, bg="white")
@@ -3703,6 +3707,13 @@ class MonitorApp:
         tk.Checkbutton(left_side, text="Dark mode", variable=self.dark_var, command=self.dark_clicked,
                        bg=INK, fg="#e6edf3", activebackground=INK, activeforeground="white", selectcolor=INK,
                        font=(UI_FONT, 9, "bold"), highlightthickness=0, cursor="hand2").pack(side="left", padx=(6, 0))
+        tk.Button(left_side, text="Compact view", command=self.enter_compact, font=(UI_FONT, 9, "bold"),
+                  bg="white", fg=INK, activebackground="#e4ebf4", relief="flat", bd=0, padx=8, pady=0,
+                  highlightthickness=1, highlightbackground="#c9d4e2", cursor="hand2").pack(side="left", padx=(12, 0))
+        self.compact = None
+        self.compact_pairs = []
+        self.compact_position = None
+        self.keep_on_top = tk.BooleanVar(master=root, value=True)
         self.viewer_note = tk.Label(left_side, text="opens a separate window with the saved logs, any time range",
                                     bg=INK, fg="#c9d4e2", font=(UI_FONT, 9))
         self.viewer_note.pack(side="right", padx=(8, 10))
@@ -3745,6 +3756,138 @@ class MonitorApp:
     def request_redraw(self):
         self.force_long = self.force_short = True
 
+    # ---- compact view ------------------------------------------------------------------
+    # A small separate window with copies of the readout boxes (spin rate and pressures of each
+    # MAS3, bearing and drive temperatures, LN2 level). The copies are kept in step with the
+    # originals every UI tick, so the full window keeps doing all the work, including logging,
+    # while it is hidden.
+
+    _CLONE_OPTIONS = ("text", "font", "fg", "bg", "anchor", "justify", "width", "height", "relief", "borderwidth",
+                      "padx", "pady", "highlightthickness", "highlightbackground", "highlightcolor")
+    _SYNC_OPTIONS = ("text", "fg", "bg", "highlightbackground", "highlightcolor")
+
+    def _clone(self, source, parent, top=True):
+        """A copy of a readout box (frames and labels), same sizes, same layout; pairs kept for syncing."""
+        kind = {"Frame": tk.Frame, "Label": tk.Label}.get(source.winfo_class())
+        if kind is None:
+            return None
+        clone = kind(parent)
+        options = []
+        for name in self._CLONE_OPTIONS:
+            try:
+                value = source.cget(name)
+            except tk.TclError:
+                continue
+            options += ["-" + name, value]
+        clone.tk.call(clone._w, "configure", *options)     # the values as shown now (already themed)
+        if top:            # the outer box keeps the size it has in the full window
+            clone.configure(width=source.winfo_width(), height=source.winfo_height())
+            clone.pack_propagate(False)
+            clone.grid_propagate(False)
+        columns, rows = source.grid_size()
+        for column in range(columns):
+            clone.columnconfigure(column, **{k: v for k, v in source.columnconfigure(column).items()})
+        for row in range(rows):
+            clone.rowconfigure(row, **{k: v for k, v in source.rowconfigure(row).items()})
+        self.compact_pairs.append((source, clone))
+        for child in source.winfo_children():
+            copy = self._clone(child, clone, top=False)
+            if copy is None:
+                continue
+            manager = child.winfo_manager()
+            if manager == "pack":
+                info = child.pack_info()
+                info.pop("in", None)
+                copy.pack(**info)
+            elif manager == "grid":
+                info = child.grid_info()
+                info.pop("in", None)
+                copy.grid(**info)
+        return clone
+
+    def enter_compact(self):
+        if self.compact is not None:
+            return
+        self.root.update_idletasks()
+        window = tk.Toplevel(self.root, bg=PANEL_BG)
+        window.title("DNP monitor (compact)")
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self.leave_compact)   # closing it brings the full window back
+        self.compact_pairs = []
+        body = tk.Frame(window, bg=PANEL_BG, padx=6, pady=6)
+        body.pack()
+
+        # Rows: MAS3 #1 | Lake Shore bearing;  MAS3 #2 | Lake Shore drive;  buttons | LN2 level
+        strip_font = (UI_FONT, 10, "bold")
+        for index, panel in enumerate(self.mas):
+            block = tk.Frame(body, bg=PANEL_BG)
+            block.grid(row=index, column=0, sticky="nw", pady=(0 if index == 0 else 6, 0))
+            tk.Label(block, text="MAS:  " + panel.name, bg=panel.color, fg="white", font=strip_font,
+                     anchor="w", padx=6).pack(fill="x")
+            row = tk.Frame(block, bg=PANEL_BG)
+            row.pack(fill="x", pady=(3, 0))
+            self._clone(panel.spin_box, row).pack(side="left")
+            self._clone(panel.pressure_box, row).pack(side="left", padx=(6, 0))
+        temperatures = [self.ls.readout_boxes[channel] for channel, _name, _color in CHANNELS]
+        sources = temperatures + ([self.ami.box] if self.ami is not None else [])
+        width = max(source.winfo_width() for source in sources)     # one width for the right-hand column
+        for index, source in enumerate(sources):
+            cell = tk.Frame(body, bg=PANEL_BG)
+            cell.grid(row=index, column=1, sticky="nw", padx=(8, 0), pady=(0 if index == 0 else 6, 0))
+            if index == 0:
+                tk.Label(cell, text="Lake Shore 336", bg=INK, fg="white", font=strip_font,
+                         anchor="w", padx=6).pack(fill="x")
+            elif index < len(self.mas):   # line the box up with the MAS3 boxes on its left, below their name strip
+                tk.Label(cell, text=" ", bg=PANEL_BG, font=strip_font).pack(fill="x")
+            clone = self._clone(source, cell)
+            clone.configure(width=width)
+            clone.pack(pady=(3, 0))
+        controls = tk.Frame(body, bg=PANEL_BG)
+        controls.grid(row=len(self.mas), column=0, sticky="nw", pady=(14, 0))
+        tk.Button(controls, text="Full monitor", command=self.leave_compact, font=(UI_FONT, 11, "bold"),
+                  bg="white", fg=INK, activebackground="#e4ebf4", padx=12, cursor="hand2").pack(side="left")
+        tk.Checkbutton(controls, text="Keep on top", variable=self.keep_on_top, command=self._compact_on_top,
+                       bg=PANEL_BG, fg=INK, activebackground=PANEL_BG, font=(UI_FONT, 10),
+                       cursor="hand2").pack(side="left", padx=(12, 0))
+
+        if THEME["dark"]:                  # the strips and buttons above were made with light colours
+            recolor_widgets(window, True)
+        self.compact = window
+        self._compact_on_top()
+        if self.compact_position:
+            window.geometry(self.compact_position)
+        self.root.withdraw()
+
+    def _compact_on_top(self):
+        if self.compact is not None:
+            try:
+                self.compact.attributes("-topmost", bool(self.keep_on_top.get()))
+            except tk.TclError:
+                pass
+
+    def sync_compact(self):
+        for source, clone in self.compact_pairs:
+            for name in self._SYNC_OPTIONS:
+                try:
+                    value = str(source.cget(name))
+                    if str(clone.cget(name)) != value:
+                        clone.tk.call(clone._w, "configure", "-" + name, value)
+                except tk.TclError:
+                    pass
+
+    def leave_compact(self):
+        if self.compact is None:
+            return
+        try:
+            self.compact_position = "+{}+{}".format(self.compact.winfo_rootx(), self.compact.winfo_rooty())
+        except tk.TclError:
+            pass
+        self.compact.destroy()
+        self.compact = None
+        self.compact_pairs = []
+        self.root.deiconify()
+        self.root.lift()
+
     def _tick(self):
         if self.closing:
             return
@@ -3754,6 +3897,8 @@ class MonitorApp:
             self.ami.tick()
         for plot in self.plots:
             plot.tick()
+        if self.compact is not None:
+            self.sync_compact()
         now = time.monotonic()
         long = self.force_long or now - self.last_long >= LONG_REDRAW_S
         short = long or self.force_short or (new and now - self.last_short >= SHORT_REDRAW_S)
