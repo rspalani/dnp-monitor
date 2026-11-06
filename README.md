@@ -6,7 +6,7 @@ Bitter Magnet Laboratory):
 | Part | What it is |
 |---|---|
 | [DNP monitor](#dnp-monitor) (`dnp_monitor.py`, `dnp_logviewer.py`) | MAS, temperature, and LN2 monitoring and logging; described below |
-| [`frequency_profile/`](frequency_profile/) | DNP frequency profiles: TopSpin acquisition scripts that step the mm-wave frequency, a live viewer, and post-run phasing; see [its README](frequency_profile/README.md) |
+| [`frequency_profile/`](frequency_profile/) | DNP frequency profiles and build-ups: TopSpin acquisition scripts that step the mm-wave frequency (`fs`) or the build-up time D1 (`bu`), a live viewer with build-up fits, and post-run phasing; see [its README](frequency_profile/README.md) |
 
 ## DNP monitor
 

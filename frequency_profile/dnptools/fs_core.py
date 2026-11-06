@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-fs_core.py  -  shared acquisition code for the DNP frequency-profile scripts
-(TopSpin / Jython)
+fs_core.py  -  shared acquisition code for the DNP frequency-profile, build-up,
+and decay scripts (TopSpin / Jython)
 
 Not run directly. The TopSpin script fs.py (in TopSpin's py/user folder) runs
     execfile("/opt/dnptools/fs_core.py")
@@ -74,7 +74,46 @@ further records.
 
 If the script is stopped from TopSpin, mm-wave 'stop' is sent and run.txt
 ends with '# end: stopped: interrupted ...'.
+Build-up runs (TopSpin script bu.py): 'bu p1' runs buildup_p1.py from the same
+folder, 'bu' alone lists the buildup_*.py files, and buildup_template.py is the
+template. A build-up run acquires one record per build-up time D1, either at
+one mm-wave frequency (FREQ and POWER; 'cw' is sent to the AWG before each ON
+record) or with the microwaves off ('stop' before each OFF record). The pulse
+program must saturate before D1, so that every scan starts from zero
+polarization. The settings that differ from a profile:
+    D1_LIST      build-up times (s), acquired in the order written; logspace(first,
+                 last, n) gives n log-spaced values
+    NS_LIST      scans per ON record: one number, or one per D1; ns_for_time(D1_LIST,
+                 seconds, ...) gives more scans at short delays
+    OFF_NS_LIST  the same for the OFF records (None: NS_LIST)
+    SERIES       the records of each set: "on" or "off" (one record per D1),
+                 "interleaved" (ON and OFF at each D1, back to back), "on_then_off"
+                 or "off_then_on" (all of one kind, then all of the other)
+    FREQ, POWER  the ON records' 'cw' command (not needed for SERIES "off")
+Template, expno checks, timing, run folder, index and viewer are as for a
+profile. The run folder is in fs_runs as well, labelled bu_<name> unless
+RUN_LABEL is set; run.txt has '# type = buildup' and an eighth column with D1
+(s), and settings.txt lists every planned record with its expected duration.
+
+Decay runs (TopSpin script decay.py): 'decay p1' runs decay_p1.py, 'decay' alone
+lists the decay_*.py files, and decay_template.py is the template. Each set
+(REPEATS) sends 'cw FREQ POWER', waits so that the reference pulse comes
+POLARIZE_TIME s after 'cw', acquires the reference record with the microwaves on,
+sends 'stop' (t = 0), and then acquires one record at each target time in
+TIMES_LIST. Every record has NS 1 and DS 0; the pulse program must not saturate,
+and its pulse should be a small flip angle (FLIP_DEG, written to run.txt for the
+viewer, which corrects for the polarization each pulse uses). The D1 of a decay
+record is set when the record is set up:
+    D1 = target - (now - t_off) - latency
+where latency, the time from setting D1 to the pulse besides D1, is the median of
+those measured on the records so far (pulse time = end of acquisition, the mtime
+of audita.txt, less AQ = TD/(2*SW_h)), ZG_LATENCY before the first measurement.
+A D1 below MIN_D1 is raised to it, so the record comes late; this is logged, and
+the time actually reached is recorded. run.txt has '# type = decay', the flip
+angle, and three more columns: D1 (s), t (s after 'stop'; negative for the
+reference), and the target time.
 """
+import math
 import os
 import re
 import time
@@ -145,6 +184,76 @@ SETTINGS = [
     ("RESPAWN_VIEWER",   True),
 ]
 
+# Build-up runs (bu.py): the settings that differ from a profile are SERIES, FREQ,
+# D1_LIST, NS_LIST and OFF_NS_LIST; POWER is needed only with ON records
+BU_SERIES = ("on", "off", "interleaved", "on_then_off", "off_then_on")
+BU_SETTINGS = [
+    ("RUN_LABEL",        REQUIRED),   # short name in the run id; default: bu_<name> of buildup_<name>.py
+    ("SAMPLE",           ""),
+    ("MAS_INFO",         ""),
+    ("DATA_DIR",         ""),         # "" (with DATA_NAME "") = the dataset open in TopSpin
+    ("DATA_NAME",        ""),
+    ("START_EXPNO",      REQUIRED),
+    ("TEMPLATE_EXPNO",   None),       # None = the expno open in TopSpin
+    ("REPEATS",          1),
+    ("SERIES",           "on"),       # one of BU_SERIES
+    ("FREQ",             None),       # GHz, for the ON records (not needed for SERIES "off")
+    ("POWER",            None),       # second argument of 'cw' (not needed for SERIES "off")
+    ("D1_LIST",          REQUIRED),   # build-up times (s), in acquisition order
+    ("NS_LIST",          REQUIRED),   # scans per ON record: one number, or a list with one per D1
+    ("OFF_NS_LIST",      None),       # scans per OFF record, as NS_LIST; None = NS_LIST
+    ("DS",               0),
+    ("AWG_SETTLE",       2),
+    ("SCAN_OVERHEAD",    5),
+    ("POLL_INTERVAL",    5),
+    ("MAX_EXTRA_WAIT",   300),
+    ("POST_ACQ_PAD",     5),
+    ("EST_OVERHEAD",     5),
+    ("AWG_RETRIES",      3),
+    ("MAX_CONSEC_SKIPS", 3),
+    ("PROCESS_CMDS",     ["efp", "absn"]),
+    ("PEAK_PPM",         None),       # None = whole spectrum
+    ("PEAK_WINDOW_PPM",  10.0),
+    ("INTENSITY_MODE",   "extreme"),  # "extreme", "max" or "sum"
+    ("LAUNCH_VIEWER",    True),
+    ("RESPAWN_VIEWER",   True),
+]
+
+
+# Decay runs (decay.py): polarize with the microwaves on, one reference record, microwaves
+# off, then one record (NS 1) at each target time after the microwaves went off
+DECAY_SETTINGS = [
+    ("RUN_LABEL",        REQUIRED),   # default: decay_<name> of decay_<name>.py
+    ("SAMPLE",           ""),
+    ("MAS_INFO",         ""),
+    ("DATA_DIR",         ""),
+    ("DATA_NAME",        ""),
+    ("START_EXPNO",      REQUIRED),
+    ("TEMPLATE_EXPNO",   None),
+    ("REPEATS",          1),          # polarize-and-decay cycles, one after the other
+    ("FREQ",             REQUIRED),   # GHz, while polarizing
+    ("POWER",            REQUIRED),   # second argument of 'cw'
+    ("POLARIZE_TIME",    REQUIRED),   # s from 'cw' to the reference pulse
+    ("TIMES_LIST",       REQUIRED),   # s after the microwaves go off, increasing: one record each
+    ("FLIP_DEG",         5.0),        # flip angle of the template's pulse (for the viewer's correction)
+    ("ZG_LATENCY",       3.0),        # s from setting D1 to the pulse, besides D1 (first guess;
+                                      # then measured on each record)
+    ("MIN_D1",           0.5),        # s; a target that comes sooner is taken late, with this D1
+    ("AWG_SETTLE",       2),
+    ("SCAN_OVERHEAD",    5),
+    ("POLL_INTERVAL",    1),
+    ("MAX_EXTRA_WAIT",   300),
+    ("POST_ACQ_PAD",     0),
+    ("EST_OVERHEAD",     5),
+    ("AWG_RETRIES",      3),
+    ("PROCESS_CMDS",     ["efp", "absn"]),
+    ("PEAK_PPM",         None),
+    ("PEAK_WINDOW_PPM",  10.0),
+    ("INTENSITY_MODE",   "extreme"),
+    ("LAUNCH_VIEWER",    True),
+    ("RESPAWN_VIEWER",   True),
+]
+
 
 def frange(start, stop, step):
     result = []
@@ -155,22 +264,71 @@ def frange(start, stop, step):
     return result
 
 
-def settings_files():
-    """Names of the settings files that can be run, without settings_template.py."""
+
+def logspace(first, last, n, digits=3):
+    """n values from first to last (both as given), evenly spaced on a logarithmic scale,
+    the ones in between rounded to `digits` significant digits; e.g. build-up times."""
+    n = int(n)
+    if float(first) <= 0 or float(last) <= 0 or n < 1:
+        raise ValueError("logspace(first, last, n) needs first > 0, last > 0 and n >= 1")
+    if n == 1:
+        return [first]
+    out = [first]
+    ratio = float(last) / float(first)
+    for i in range(1, n - 1):
+        v = float(first) * ratio ** (float(i) / (n - 1))
+        v = round(v, digits - 1 - int(math.floor(math.log10(v))))
+        out.append(int(v) if v == int(v) else v)
+    out.append(last)
+    return out
+
+
+def ns_for_time(d1_list, seconds, ns_min=None, ns_max=None, multiple=1, overhead=0.0):
+    """Scans per record for records of about `seconds` each: seconds / (D1 + overhead)
+    for each D1 in d1_list, at most ns_max, rounded down to a multiple of `multiple`
+    (e.g. the phase cycle), and at least ns_min (default: multiple). overhead: s per
+    scan besides D1 (e.g. SCAN_OVERHEAD)."""
+    multiple = max(1, int(multiple))
+    lo = multiple if ns_min is None else int(ns_min)
+    out = []
+    for d1 in d1_list:
+        ns = int(float(seconds) / (float(d1) + float(overhead)))
+        if ns_max is not None:
+            ns = min(ns, int(ns_max))
+        out.append(max(lo, (ns // multiple) * multiple))
+    return out
+
+
+def fmt_dur(sec):
+    sec = int(round(sec))
+    if sec >= 3600:
+        return "%d h %02d min" % (sec // 3600, (sec % 3600) // 60)
+    if sec >= 60:
+        return "%d min %02d s" % (sec // 60, sec % 60)
+    return "%d s" % sec
+
+
+def html_text(x):
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def settings_files(prefix="settings_"):
+    """Names of the settings files that can be run (prefix: settings_ for fs, buildup_
+    for bu), without the template."""
     try:
         names = os.listdir(SETTINGS_DIR)
     except CATCH:
         return []
-    return sorted([n for n in names if n.startswith("settings_") and n.endswith(".py")
-                   and n != "settings_template.py"])
+    return sorted([n for n in names if n.startswith(prefix) and n.endswith(".py")
+                   and n != prefix + "template.py"])
 
 
-def choose_settings():
+def choose_settings(cmd="fs", prefix="settings_"):
     """Lets the user pick a settings file; returns its name or None."""
-    names = settings_files()
+    names = settings_files(prefix)
     if not names:
-        ERRMSG("fs: there are no settings files in %s.\nCopy settings_template.py there to "
-               "settings_<name>.py and fill it in." % SETTINGS_DIR)
+        ERRMSG("%s: there are no settings files in %s.\nCopy %stemplate.py there to "
+               "%s<name>.py and fill it in." % (cmd, SETTINGS_DIR, prefix, prefix))
         return None
     from javax.swing import JOptionPane
     try:
@@ -180,64 +338,83 @@ def choose_settings():
     except CATCH:
         options = names
     choice = JOptionPane.showInputDialog(
-        None, "Settings file to run (in %s):" % SETTINGS_DIR, "fs: choose the settings",
+        None, "Settings file to run (in %s):" % SETTINGS_DIR, "%s: choose the settings" % cmd,
         JOptionPane.QUESTION_MESSAGE, None, options, options[0])
     if choice is None:
         return None
     return str(choice)
 
 
-def settings_path(name):
-    """Path of the settings file meant by name: a path, 'settings_bdpa(.py)' or 'bdpa'."""
+def settings_path(name, prefix="settings_"):
+    """Path of the settings file meant by name: a path, 'settings_bdpa(.py)' or 'bdpa'
+    (with prefix settings_; buildup_p1(.py) or p1 with prefix buildup_)."""
     name = str(name).strip()
     if os.sep in name or name.endswith(".py"):
         p = name if os.path.isabs(name) else os.path.join(SETTINGS_DIR, name)
         if not p.endswith(".py"):
             p += ".py"
         return p
-    for cand in (name + ".py", "settings_" + name + ".py"):
+    for cand in (name + ".py", prefix + name + ".py"):
         p = os.path.join(SETTINGS_DIR, cand)
         if os.path.isfile(p):
             return p
-    return os.path.join(SETTINGS_DIR, "settings_" + name + ".py")
+    return os.path.join(SETTINGS_DIR, prefix + name + ".py")
 
 
 def run_settings(args=None):
     """Entry point of fs.py. args: the words after 'fs' on TopSpin's command line."""
+    run_from_args(args, "fs", "settings_", "", run_profile)
+
+
+def run_buildup_settings(args=None):
+    """Entry point of bu.py. args: the words after 'bu' on TopSpin's command line."""
+    run_from_args(args, "bu", "buildup_", "bu_", run_buildup)
+
+
+def run_decay_settings(args=None):
+    """Entry point of decay.py. args: the words after 'decay' on TopSpin's command line."""
+    run_from_args(args, "decay", "decay_", "decay_", run_decay)
+
+
+def run_from_args(args, cmd, prefix, label_prefix, runner):
+    """Finds and reads the settings file named in args (or chosen from a list) and runs it
+    with runner; RUN_LABEL defaults to label_prefix + <name> of <prefix><name>.py."""
     args = [str(a) for a in (args or []) if str(a).strip()]
-    name = args[0] if args else choose_settings()
+    name = args[0] if args else choose_settings(cmd, prefix)
     if not name:
-        MSG("fs: no settings file chosen; nothing was started.")
+        MSG("%s: no settings file chosen; nothing was started." % cmd)
         return
-    path = settings_path(name)
+    path = settings_path(name, prefix)
     base = os.path.basename(path)
-    if base == "settings_template.py":
-        ERRMSG("fs: settings_template.py is the template and is not run.\nCopy it to "
-               "%s/settings_<name>.py, fill it in, and run 'fs <name>'." % SETTINGS_DIR)
+    template = prefix + "template.py"
+    if base == template:
+        ERRMSG("%s: %s is the template and is not run.\nCopy it to "
+               "%s/%s<name>.py, fill it in, and run '%s <name>'." % (cmd, template, SETTINGS_DIR, prefix, cmd))
         return
     if not os.path.isfile(path):
-        avail = ", ".join([n[len("settings_"):-3] for n in settings_files()]) or "none"
-        ERRMSG("fs: settings file %s not found.\nAvailable in %s: %s" % (path, SETTINGS_DIR, avail))
+        avail = ", ".join([n[len(prefix):-3] for n in settings_files(prefix)]) or "none"
+        ERRMSG("%s: settings file %s not found.\nAvailable in %s: %s" % (cmd, path, SETTINGS_DIR, avail))
         return
-    ns = {"frange": frange}
+    ns = {"frange": frange, "logspace": logspace, "ns_for_time": ns_for_time}
     try:
         execfile(path, ns)
     except CATCH as ex:
-        ERRMSG("fs: error in the settings file %s:\n%s\nNothing was started." % (path, ex))
+        ERRMSG("%s: error in the settings file %s:\n%s\nNothing was started." % (cmd, path, ex))
         return
     S = dict([(k, v) for k, v in ns.items() if k.isupper()])
     if "RUN_LABEL" not in S:
         stem = base[:-3]
-        S["RUN_LABEL"] = stem[len("settings_"):] if stem.startswith("settings_") else stem
-    run_profile(S, path)
+        S["RUN_LABEL"] = label_prefix + (stem[len(prefix):] if stem.startswith(prefix) else stem)
+    runner(S, path)
 
 
-def run_profile(S, source=None):
-    """Runs the profile described by the settings dict S; source: the settings file, if any."""
-    # ---- Settings ------------------------------------------------------------
-    names = [n for n, d in SETTINGS]
+def check_settings(S, table, hint=""):
+    """All settings of table, with the defaults for those not in S; None (after an error
+    box) if S has an unknown setting or lacks a required one. hint: added to the box
+    when there are unknown settings."""
+    names = [n for n, d in table]
     unknown = sorted([k for k in S.keys() if k.isupper() and k not in names])
-    missing = [n for n, d in SETTINGS
+    missing = [n for n, d in table
                if d == REQUIRED and (n not in S or S[n] is None or S[n] == "")]
     if unknown or missing:
         lines = []
@@ -245,48 +422,49 @@ def run_profile(S, source=None):
             lines.append("Unknown setting(s): %s" % ", ".join(unknown))
         if missing:
             lines.append("Missing setting(s): %s" % ", ".join(missing))
+        if unknown and hint:
+            lines.append(hint)
         ERRMSG("fs_core.py: %s.\nNothing was started." % ".\n".join(lines))
-        return
+        return None
     c = {}
-    for n, d in SETTINGS:
+    for n, d in table:
         if n in S:
             c[n] = S[n]
         elif isinstance(d, list):
             c[n] = list(d)
         else:
             c[n] = d
+    return c
 
+
+def failer(label):
+    def fail(msg):
+        ERRMSG("fs_core.py (%s): %s\nNothing was started." % (label, msg))
+    return fail
+
+
+def run_profile(S, source=None):
+    """Runs the profile described by the settings dict S; source: the settings file, if any."""
+    # ---- Settings ------------------------------------------------------------
+    c = check_settings(S, SETTINGS, "This looks like a build-up settings file: run it with 'bu'"
+                       if ("D1_LIST" in S or "SERIES" in S) else
+                       "This looks like a decay settings file: run it with 'decay'"
+                       if ("TIMES_LIST" in S or "POLARIZE_TIME" in S) else "")
+    if c is None:
+        return
     RUN_LABEL        = str(c["RUN_LABEL"]).strip()
     SAMPLE           = c["SAMPLE"]
     MAS_INFO         = c["MAS_INFO"]
-    DATA_DIR         = c["DATA_DIR"]
-    DATA_NAME        = c["DATA_NAME"]
     POWER            = c["POWER"]
-    START_EXPNO      = c["START_EXPNO"]
-    TEMPLATE_EXPNO   = c["TEMPLATE_EXPNO"]
     REPEATS          = c["REPEATS"]
     OFF_MODE         = str(c["OFF_MODE"]).strip().lower()
     D1               = c["D1"]
     DS               = c["DS"]
     PROFILE_NS       = c["PROFILE_NS"]
     OFF_SCANS        = c["OFF_SCANS"]
-    AWG_SETTLE       = c["AWG_SETTLE"]
-    SCAN_OVERHEAD    = c["SCAN_OVERHEAD"]
-    POLL_INTERVAL    = c["POLL_INTERVAL"]
-    MAX_EXTRA_WAIT   = c["MAX_EXTRA_WAIT"]
-    POST_ACQ_PAD     = c["POST_ACQ_PAD"]
-    EST_OVERHEAD     = c["EST_OVERHEAD"]
-    AWG_RETRIES      = c["AWG_RETRIES"]
-    MAX_CONSEC_SKIPS = c["MAX_CONSEC_SKIPS"]
-    PROCESS_CMDS     = list(c["PROCESS_CMDS"])
-    PEAK_PPM         = c["PEAK_PPM"]
-    PEAK_WINDOW_PPM  = c["PEAK_WINDOW_PPM"]
     INTENSITY_MODE   = str(c["INTENSITY_MODE"]).strip().lower()
-    LAUNCH_VIEWER    = c["LAUNCH_VIEWER"]
-    RESPAWN_VIEWER   = c["RESPAWN_VIEWER"]
-
-    def fail(msg):
-        ERRMSG("fs_core.py (%s): %s\nNothing was started." % (RUN_LABEL, msg))
+    fail = failer(RUN_LABEL)
+    h = html_text
 
     if not re.match(r"^[A-Za-z0-9_-]+$", RUN_LABEL):
         fail("RUN_LABEL may contain only letters, digits, '-' and '_' (got '%s')." % RUN_LABEL)
@@ -308,6 +486,586 @@ def run_profile(S, source=None):
     if not freqs:
         fail("FREQS is empty.")
         return
+    try:
+        float(POWER)
+    except CATCH:
+        fail("POWER must be a number (got %r)." % (POWER,))
+        return
+
+    # ---- Run plan: per set an optional OFF, one ON per frequency, an optional OFF ----
+    per_set = []
+    if OFF_MODE in ("start", "both"):
+        per_set.append(("OFF", "start"))
+    for f in freqs:
+        per_set.append(("ON", f))
+    if OFF_MODE in ("end", "both"):
+        per_set.append(("OFF", "end"))
+    points_per_set  = len(freqs)
+    records_per_set = len(per_set)
+    n_off_per_set   = records_per_set - points_per_set
+
+    def set_tag(set_number):
+        return ("set %d | " % set_number) if REPEATS > 1 else ""
+
+    def make_plan(start_expno):
+        plan = []
+        for set_number in range(1, REPEATS + 1):
+            base = start_expno + (set_number - 1) * records_per_set
+            tag = set_tag(set_number)
+            for i in range(records_per_set):
+                kind, val = per_set[i]
+                if kind == "OFF":
+                    plan.append({
+                        "expno": base + i, "set": set_number, "kind": "OFF", "label": val,
+                        "freq": None, "d1": D1, "ns": OFF_SCANS, "awg": "stop",
+                        "title": ("OFF (%s) | %s%s | %s | microwave off | D1 = %s s | %d scans"
+                                  % (val, tag, SAMPLE, MAS_INFO, D1, OFF_SCANS)),
+                        "what": "%sOFF %s" % (tag, val)})
+                else:
+                    cmdstr = 'cw %.3f %.2f' % (val, POWER)
+                    plan.append({
+                        "expno": base + i, "set": set_number, "kind": "ON", "label": "on",
+                        "freq": val, "d1": D1, "ns": PROFILE_NS, "awg": cmdstr,
+                        "title": ("freq profile | %s%s | %s | %s | D1 = %s s | %d scan(s)"
+                                  % (tag, SAMPLE, MAS_INFO, cmdstr, D1, PROFILE_NS)),
+                        "what": "%sON %.3f GHz" % (tag, val),
+                        "skip": "%s%.3f GHz" % (tag, val), "last": "%.3f GHz" % val})
+        return plan
+
+    def dialog_rows(plan):
+        def set_line(set_number):
+            recs = [p for p in plan if p["set"] == set_number]
+            offs = [p["expno"] for p in recs if p["kind"] == "OFF"]
+            ons  = [p["expno"] for p in recs if p["kind"] == "ON"]
+            parts = []
+            if OFF_MODE in ("start", "both"):
+                parts.append("OFF %d" % offs[0])
+            parts.append("ON %d&#8211;%d" % (ons[0], ons[-1]))
+            if OFF_MODE in ("end", "both"):
+                parts.append("OFF %d" % offs[-1])
+            pre = ("set %d: " % set_number) if REPEATS > 1 else ""
+            return pre + ", then ".join(parts)
+
+        shown = list(range(1, REPEATS + 1))
+        if REPEATS > 6:
+            shown = [1, 2, 3, None, REPEATS]
+        plan_html = "<br>".join([("..." if n is None else set_line(n)) for n in shown])
+
+        sf = sorted(freqs)
+        gaps = [round((b - a) * 1000.0, 3) for a, b in zip(sf[:-1], sf[1:])]
+        if not gaps:
+            spacing = ""
+        elif min(gaps) == max(gaps):
+            spacing = ", %g MHz apart" % gaps[0]
+        else:
+            spacing = ", %g&#8211;%g MHz apart" % (min(gaps), max(gaps))
+        freq_html = "%d per set, %.3f&#8211;%.3f GHz%s" % (points_per_set, sf[0], sf[-1], spacing)
+        return [("Plan", plan_html), ("Frequencies", freq_html),
+                ("Scans", "ON records NS %d, OFF records NS %d; D1 %s s, DS %d; power %.2f"
+                 % (PROFILE_NS, OFF_SCANS, h(D1), DS, POWER))]
+
+    def timing(plan, record_time):
+        per_point_time = record_time(PROFILE_NS, D1)
+        off_time       = record_time(OFF_SCANS, D1)
+        total_time     = REPEATS * (per_point_time * points_per_set + off_time * n_off_per_set)
+        note = ("ON ~%s per point, OFF ~%s each" % (fmt_dur(per_point_time), fmt_dur(off_time))
+                if n_off_per_set else "ON ~%s per point" % fmt_dur(per_point_time))
+        return total_time, note
+
+    def header(run_id, ds_root, peak_str, started):
+        return ("# fs run file (read by fs_plot.py and fs_rephase.py)\n"
+                "# run_id = %s\n"
+                "# label = %s\n"
+                "# sample = %s\n"
+                "# conditions = %s\n"
+                "# dataset_dir = %s\n"
+                "# off_mode = %s\n"
+                "# peak_ppm = %s\n"
+                "# window_ppm = %s\n"
+                "# mode = %s\n"
+                "# power = %.2f\n"
+                "# d1 = %s\n"
+                "# repeats = %d\n"
+                "# started = %s\n"
+                "# columns: expno, kind, label, freq_GHz, ns, finished, set\n"
+                % (run_id, RUN_LABEL, SAMPLE, MAS_INFO, ds_root, OFF_MODE, peak_str,
+                   repr(float(c["PEAK_WINDOW_PPM"])), INTENSITY_MODE, POWER, D1, REPEATS, started))
+
+    run_records(c, {
+        "noun": "frequency profile", "table": SETTINGS, "make_plan": make_plan,
+        "dialog_rows": dialog_rows, "timing": timing, "header": header,
+        "used": {"OFF_MODE": OFF_MODE, "FREQS": freqs},
+        "settings_comments": lambda plan, record_time: [],
+        "d1_column": False, "on_noun": "ON points",
+        "start_desc": "%d set(s), OFF mode %s, %d ON points per set" % (REPEATS, OFF_MODE, points_per_set),
+        "end_desc": "%d set(s), OFF mode %s" % (REPEATS, OFF_MODE)}, source)
+
+
+def run_buildup(S, source=None):
+    """Runs the build-up described by the settings dict S; source: the settings file, if any."""
+    # ---- Settings ------------------------------------------------------------
+    c = check_settings(S, BU_SETTINGS, "This looks like a frequency-profile settings file: run it "
+                       "with 'fs'" if ("FREQS" in S or "OFF_MODE" in S) else
+                       "This looks like a decay settings file: run it with 'decay'"
+                       if ("TIMES_LIST" in S or "POLARIZE_TIME" in S) else "")
+    if c is None:
+        return
+    RUN_LABEL        = str(c["RUN_LABEL"]).strip()
+    SAMPLE           = c["SAMPLE"]
+    MAS_INFO         = c["MAS_INFO"]
+    REPEATS          = c["REPEATS"]
+    SERIES           = str(c["SERIES"]).strip().lower()
+    DS               = c["DS"]
+    INTENSITY_MODE   = str(c["INTENSITY_MODE"]).strip().lower()
+    fail = failer(RUN_LABEL)
+
+    if not re.match(r"^[A-Za-z0-9_-]+$", RUN_LABEL):
+        fail("RUN_LABEL may contain only letters, digits, '-' and '_' (got '%s')." % RUN_LABEL)
+        return
+    if SERIES not in BU_SERIES:
+        fail("SERIES must be one of %s (got '%s')." % (", ".join(["'%s'" % s for s in BU_SERIES]), SERIES))
+        return
+    if INTENSITY_MODE not in ("extreme", "max", "sum"):
+        fail("INTENSITY_MODE must be 'extreme', 'max' or 'sum' (got '%s')." % INTENSITY_MODE)
+        return
+    if not isinstance(REPEATS, int) or REPEATS < 1:
+        fail("REPEATS must be a positive integer.")
+        return
+
+    def num(x):
+        v = float(x)
+        return int(v) if v == int(v) else v
+    try:
+        d1s = [num(x) for x in c["D1_LIST"]]
+    except CATCH:
+        fail("D1_LIST must be a list of build-up times in s.")
+        return
+    if not d1s:
+        fail("D1_LIST is empty.")
+        return
+    if min(d1s) <= 0:
+        fail("D1_LIST has a value that is not positive: %s." % min(d1s))
+        return
+
+    def ns_list(name, val):
+        """val as one NS per D1, or None after an error box."""
+        vals = val if isinstance(val, (list, tuple)) else [val] * len(d1s)
+        if len(vals) != len(d1s):
+            fail("%s has %d values, but D1_LIST has %d." % (name, len(vals), len(d1s)))
+            return None
+        out = []
+        for v in vals:
+            try:
+                ok = float(v) == int(v) and int(v) >= 1
+            except CATCH:
+                ok = False
+            if not ok:
+                fail("%s must hold whole numbers of scans, 1 or more (got %r)." % (name, v))
+                return None
+            out.append(int(v))
+        return out
+    ns_on = ns_list("NS_LIST", c["NS_LIST"])
+    if ns_on is None:
+        return
+    has_on, has_off = SERIES != "off", SERIES != "on"
+    ns_off = ns_on
+    if c["OFF_NS_LIST"] is not None:
+        ns_off = ns_list("OFF_NS_LIST", c["OFF_NS_LIST"])
+        if ns_off is None:
+            return
+    FREQ, POWER = c["FREQ"], c["POWER"]
+    if has_on:
+        for name in ("FREQ", "POWER"):
+            try:
+                float(c[name])
+            except CATCH:
+                fail("SERIES '%s' has ON records: set %s, %s (got %r)."
+                     % (SERIES, name, "the mm-wave frequency in GHz" if name == "FREQ"
+                        else "the second argument of the AWG 'cw' command", c[name]))
+                return
+        FREQ, POWER = float(FREQ), float(POWER)
+
+    # ---- Run plan ---------------------------------------------------------------
+    n = len(d1s)
+    if SERIES == "on":
+        per_set = [("ON", i) for i in range(n)]
+    elif SERIES == "off":
+        per_set = [("OFF", i) for i in range(n)]
+    elif SERIES == "interleaved":
+        per_set = []
+        for i in range(n):
+            per_set += [("ON", i), ("OFF", i)]
+    elif SERIES == "on_then_off":
+        per_set = [("ON", i) for i in range(n)] + [("OFF", i) for i in range(n)]
+    else:
+        per_set = [("OFF", i) for i in range(n)] + [("ON", i) for i in range(n)]
+    cmdstr = ('cw %.3f %.2f' % (FREQ, POWER)) if has_on else None
+
+    def set_tag(set_number):
+        return ("set %d | " % set_number) if REPEATS > 1 else ""
+
+    def make_plan(start_expno):
+        plan = []
+        for set_number in range(1, REPEATS + 1):
+            base = start_expno + (set_number - 1) * len(per_set)
+            tag = set_tag(set_number)
+            for j, (kind, i) in enumerate(per_set):
+                d1 = d1s[i]
+                if kind == "OFF":
+                    ns = ns_off[i]
+                    plan.append({
+                        "expno": base + j, "set": set_number, "kind": "OFF", "label": "off",
+                        "freq": None, "d1": d1, "ns": ns, "awg": "stop",
+                        "title": ("build-up | %s%s | %s | microwave off | D1 = %s s | %d scan(s)"
+                                  % (tag, SAMPLE, MAS_INFO, d1, ns)),
+                        "what": "%sOFF D1 %s s" % (tag, d1)})
+                else:
+                    ns = ns_on[i]
+                    plan.append({
+                        "expno": base + j, "set": set_number, "kind": "ON", "label": "on",
+                        "freq": FREQ, "d1": d1, "ns": ns, "awg": cmdstr,
+                        "title": ("build-up | %s%s | %s | %s | D1 = %s s | %d scan(s)"
+                                  % (tag, SAMPLE, MAS_INFO, cmdstr, d1, ns)),
+                        "what": "%sON D1 %s s" % (tag, d1),
+                        "skip": "%sON at D1 %s s" % (tag, d1), "last": "D1 %s s" % d1})
+        return plan
+
+    def d1_ns_html(nss):
+        return ", ".join(["%s&nbsp;s&nbsp;&#215;&nbsp;%d" % (d1, k) for d1, k in zip(d1s, nss)])
+
+    def dialog_rows(plan):
+        def set_line(set_number):
+            recs = [p for p in plan if p["set"] == set_number]
+            first, last = recs[0]["expno"], recs[-1]["expno"]
+            if SERIES == "interleaved":
+                body = "ON and OFF at each D1, ON first: %d&#8211;%d" % (first, last)
+            elif SERIES in ("on", "off"):
+                body = "%s %d&#8211;%d" % (SERIES.upper(), first, last)
+            else:
+                k1 = recs[0]["kind"]
+                a = [p["expno"] for p in recs if p["kind"] == k1]
+                b = [p["expno"] for p in recs if p["kind"] != k1]
+                k2 = "OFF" if k1 == "ON" else "ON"
+                body = "%s %d&#8211;%d, then %s %d&#8211;%d" % (k1, a[0], a[-1], k2, b[0], b[-1])
+            pre = ("set %d: " % set_number) if REPEATS > 1 else ""
+            return pre + body
+
+        shown = list(range(1, REPEATS + 1))
+        if REPEATS > 6:
+            shown = [1, 2, 3, None, REPEATS]
+        rows = [("Plan", "<br>".join([("..." if k is None else set_line(k)) for k in shown]))]
+        mw = []
+        if has_on:
+            mw.append("ON records: %.3f GHz, power %.2f (AWG '%s')" % (FREQ, POWER, cmdstr))
+        if has_off:
+            mw.append("OFF records: microwave off (AWG 'stop')")
+        rows.append(("mm-wave", "<br>".join(mw)))
+        same = (not has_on) or (not has_off) or ns_on == ns_off
+        if same:
+            rows.append(("D1 &#215; NS", d1_ns_html(ns_on if has_on else ns_off)))
+        else:
+            rows.append(("D1 &#215; NS", "ON: %s<br>OFF: %s" % (d1_ns_html(ns_on), d1_ns_html(ns_off))))
+        rows.append(("Scans", "%d build-up times per set, %s&#8211;%s s, in this order; DS %d. "
+                     "The pulse program must saturate before D1." % (n, min(d1s), max(d1s), DS)))
+        return rows
+
+    def timing(plan, record_time):
+        times = [record_time(p["ns"], p["d1"]) for p in plan]
+        total = sum(times)
+        k = times.index(max(times))
+        return total, ("longest record ~%s (D1 %s s, NS %d)"
+                       % (fmt_dur(times[k]), plan[k]["d1"], plan[k]["ns"]))
+
+    def header(run_id, ds_root, peak_str, started):
+        return ("# fs run file (read by fs_plot.py and fs_rephase.py)\n"
+                "# type = buildup\n"
+                "# run_id = %s\n"
+                "# label = %s\n"
+                "# sample = %s\n"
+                "# conditions = %s\n"
+                "# dataset_dir = %s\n"
+                "# series = %s\n"
+                "# freq_GHz = %s\n"
+                "# power = %s\n"
+                "# peak_ppm = %s\n"
+                "# window_ppm = %s\n"
+                "# mode = %s\n"
+                "# ds = %s\n"
+                "# repeats = %d\n"
+                "# started = %s\n"
+                "# columns: expno, kind, label, freq_GHz, ns, finished, set, d1_s\n"
+                % (run_id, RUN_LABEL, SAMPLE, MAS_INFO, ds_root, SERIES,
+                   ("%.4f" % FREQ) if has_on else "-", ("%.2f" % POWER) if has_on else "-",
+                   peak_str, repr(float(c["PEAK_WINDOW_PPM"])), INTENSITY_MODE, DS, REPEATS, started))
+
+    def settings_comments(plan, record_time):
+        out = ["# planned records (expno, set, kind, D1 s, NS, expected s; read by fs_plot.py):"]
+        for p in plan:
+            out.append("# record: %d %d %s %s %d %d" % (p["expno"], p["set"], p["kind"], p["d1"], p["ns"],
+                                                        int(round(record_time(p["ns"], p["d1"])))))
+        return out
+
+    run_records(c, {
+        "noun": "build-up", "table": BU_SETTINGS, "make_plan": make_plan,
+        "dialog_rows": dialog_rows, "timing": timing, "header": header,
+        "used": {"SERIES": SERIES, "FREQ": FREQ, "POWER": POWER, "D1_LIST": d1s,
+                 "NS_LIST": ns_on, "OFF_NS_LIST": ns_off if has_off else c["OFF_NS_LIST"]},
+        "settings_comments": settings_comments,
+        "d1_column": True, "on_noun": "ON records",
+        "start_desc": "%d set(s), series %s, %d build-up times per set" % (REPEATS, SERIES, n),
+        "end_desc": "%d set(s), series %s" % (REPEATS, SERIES)}, source)
+
+
+def run_decay(S, source=None):
+    """Runs the decay described by the settings dict S; source: the settings file, if any.
+    Per set: 'cw' and POLARIZE_TIME s of polarization, ending with a reference record (ON,
+    NS 1); 'stop'; then one record (OFF, NS 1) per target time after the microwaves went off,
+    each with the D1 that brings its pulse to that time."""
+    # ---- Settings ------------------------------------------------------------
+    c = check_settings(S, DECAY_SETTINGS, "This looks like a frequency-profile or build-up settings "
+                       "file: run it with 'fs' or 'bu'" if ("FREQS" in S or "D1_LIST" in S) else "")
+    if c is None:
+        return
+    RUN_LABEL        = str(c["RUN_LABEL"]).strip()
+    SAMPLE           = c["SAMPLE"]
+    MAS_INFO         = c["MAS_INFO"]
+    REPEATS          = c["REPEATS"]
+    INTENSITY_MODE   = str(c["INTENSITY_MODE"]).strip().lower()
+    AWG_SETTLE       = c["AWG_SETTLE"]
+    fail = failer(RUN_LABEL)
+
+    if not re.match(r"^[A-Za-z0-9_-]+$", RUN_LABEL):
+        fail("RUN_LABEL may contain only letters, digits, '-' and '_' (got '%s')." % RUN_LABEL)
+        return
+    if INTENSITY_MODE not in ("extreme", "max", "sum"):
+        fail("INTENSITY_MODE must be 'extreme', 'max' or 'sum' (got '%s')." % INTENSITY_MODE)
+        return
+    if not isinstance(REPEATS, int) or REPEATS < 1:
+        fail("REPEATS must be a positive integer.")
+        return
+    nums = {}
+    for name in ("FREQ", "POWER", "POLARIZE_TIME", "FLIP_DEG", "ZG_LATENCY", "MIN_D1"):
+        try:
+            nums[name] = float(c[name])
+        except CATCH:
+            fail("%s must be a number (got %r)." % (name, c[name]))
+            return
+    FREQ, POWER, POLARIZE_TIME = nums["FREQ"], nums["POWER"], nums["POLARIZE_TIME"]
+    FLIP_DEG, ZG_LATENCY, MIN_D1 = nums["FLIP_DEG"], nums["ZG_LATENCY"], nums["MIN_D1"]
+    if POLARIZE_TIME <= 0:
+        fail("POLARIZE_TIME must be positive.")
+        return
+    if not 0 < FLIP_DEG < 180:
+        fail("FLIP_DEG must be between 0 and 180 (got %s)." % FLIP_DEG)
+        return
+
+    def num(x):
+        v = float(x)
+        return int(v) if v == int(v) else v
+    try:
+        targets = [num(x) for x in c["TIMES_LIST"]]
+    except CATCH:
+        fail("TIMES_LIST must be a list of times in s after the microwaves go off.")
+        return
+    if not targets:
+        fail("TIMES_LIST is empty.")
+        return
+    if min(targets) <= 0 or [t for a, t in zip(targets[:-1], targets[1:]) if t <= a]:
+        fail("TIMES_LIST must hold positive times in increasing order.")
+        return
+    cmdstr = 'cw %.3f %.2f' % (FREQ, POWER)
+    c = dict(c, DS=0, MAX_CONSEC_SKIPS=1)        # the engine's settings that decays do not have
+    rec_s = c["EST_OVERHEAD"] + c["SCAN_OVERHEAD"] + c["POST_ACQ_PAD"]   # s per record besides D1
+
+    def set_tag(set_number):
+        return ("set %d | " % set_number) if REPEATS > 1 else ""
+
+    def make_plan(start_expno):
+        plan = []
+        per_set = len(targets) + 1
+        for set_number in range(1, REPEATS + 1):
+            base = start_expno + (set_number - 1) * per_set
+            tag = set_tag(set_number)
+            plan.append({
+                "expno": base, "set": set_number, "kind": "ON", "label": "ref", "freq": FREQ,
+                "d1": num(POLARIZE_TIME), "ns": 1, "awg": cmdstr, "role": "ref", "target": 0,
+                "title": ("decay reference | %s%s | %s | %s | %g s polarization | 1 scan"
+                          % (tag, SAMPLE, MAS_INFO, cmdstr, POLARIZE_TIME)),
+                "what": "%sreference after %g s with '%s'" % (tag, POLARIZE_TIME, cmdstr),
+                "skip": "", "last": ""})
+            for j, t in enumerate(targets):
+                plan.append({
+                    "expno": base + 1 + j, "set": set_number, "kind": "OFF", "label": "decay", "freq": None,
+                    "d1": t, "ns": 1, "awg": None, "role": "decay", "target": t,
+                    "title": ("decay | %s%s | %s | microwave off | t = %s s after it went off | 1 scan"
+                              % (tag, SAMPLE, MAS_INFO, t)),
+                    "what": "%sdecay t = %s s" % (tag, t)})
+        return plan
+
+    def expected(p):
+        """Expected duration of a record, for the time estimate and the viewer's expected end."""
+        if p["role"] == "ref":
+            return POLARIZE_TIME + AWG_SETTLE + rec_s
+        i = targets.index(p["target"])
+        return max(p["target"] - (targets[i - 1] if i else 0), MIN_D1 + rec_s)
+
+    def dialog_rows(plan):
+        shown = list(range(1, REPEATS + 1))
+        if REPEATS > 6:
+            shown = [1, 2, 3, None, REPEATS]
+        lines = []
+        for k in shown:
+            if k is None:
+                lines.append("...")
+                continue
+            recs = [p for p in plan if p["set"] == k]
+            lines.append("%sreference %d, then decay %d&#8211;%d"
+                         % (("set %d: " % k) if REPEATS > 1 else "", recs[0]["expno"], recs[1]["expno"],
+                            recs[-1]["expno"]))
+        gaps = [b - a for a, b in zip([0] + targets[:-1], targets)]
+        tight = [t for t, g in zip(targets, gaps) if g < rec_s + MIN_D1 + ZG_LATENCY]
+        tx = ", ".join(["%s" % t for t in targets])
+        if tight:
+            tx += ("<br><font color='#a04000'>%d target(s) less than about %d s after the one before "
+                   "(%s s): each comes as soon as the record before it is done</font>"
+                   % (len(tight), int(rec_s + MIN_D1 + ZG_LATENCY), ", ".join(["%s" % t for t in tight])))
+        return [("Plan", "<br>".join(lines)),
+                ("mm-wave", "AWG '%s', reference record after %g s (%s), then 'stop'"
+                 % (cmdstr, POLARIZE_TIME, fmt_dur(POLARIZE_TIME))),
+                ("Times", "%d per set, s after the microwaves go off: %s" % (len(targets), tx)),
+                ("Scans", "NS 1, DS 0 on every record; D1 set for each record to reach its time. "
+                          "Flip angle %g&#176; (from the template; for the viewer's correction); "
+                          "no saturation in the pulse program." % FLIP_DEG)]
+
+    def timing(plan, record_time):
+        total = sum([expected(p) for p in plan])
+        return total, ("per set: %s polarizing, then %s of decay"
+                       % (fmt_dur(POLARIZE_TIME), fmt_dur(targets[-1])))
+
+    def header(run_id, ds_root, peak_str, started):
+        return ("# fs run file (read by fs_plot.py and fs_rephase.py)\n"
+                "# type = decay\n"
+                "# run_id = %s\n"
+                "# label = %s\n"
+                "# sample = %s\n"
+                "# conditions = %s\n"
+                "# dataset_dir = %s\n"
+                "# freq_GHz = %.4f\n"
+                "# power = %.2f\n"
+                "# polarize_s = %s\n"
+                "# flip_deg = %s\n"
+                "# peak_ppm = %s\n"
+                "# window_ppm = %s\n"
+                "# mode = %s\n"
+                "# repeats = %d\n"
+                "# started = %s\n"
+                "# t_s: time of the record's pulse after the microwaves went off (end of acquisition\n"
+                "#      less AQ); target_s: the time aimed at\n"
+                "# columns: expno, kind, label, freq_GHz, ns, finished, set, d1_s, t_s, target_s\n"
+                % (run_id, RUN_LABEL, SAMPLE, MAS_INFO, ds_root, FREQ, POWER, POLARIZE_TIME, FLIP_DEG,
+                   peak_str, repr(float(c["PEAK_WINDOW_PPM"])), INTENSITY_MODE, REPEATS, started))
+
+    def settings_comments(plan, record_time):
+        out = ["# planned records (expno, set, kind, D1 or target s, NS, expected s; read by fs_plot.py):"]
+        for p in plan:
+            out.append("# record: %d %d %s %s %d %d" % (p["expno"], p["set"], p["kind"], p["d1"], 1,
+                                                        int(round(expected(p)))))
+        return out
+
+    def row_extra(rec):
+        return "\t%.3f\t%s" % (rec.get("t", float("nan")), rec["target"])
+
+    state = {"t_cw": None, "t_off": None, "lat": []}
+
+    def latency():
+        lat = sorted(state["lat"])
+        if not lat:
+            return ZG_LATENCY
+        return lat[len(lat) // 2]
+
+    def aq_s(ops, expno):
+        try:
+            return float(ops["acqus_param"](expno, "TD")) / (2.0 * float(ops["acqus_param"](expno, "SW_h")))
+        except CATCH:
+            return 0.0
+
+    def runner(rec, ops):
+        """Acquires one record of a decay: the reference ('cw', polarization, record, 'stop'),
+        or a decay record with the D1 that brings its pulse to its target time."""
+        expno = rec["expno"]
+        if rec["role"] == "ref":
+            if not ops["awg"](cmdstr):
+                raise RunAbort("could not send '%s' to the AWG to polarize (set %d)" % (cmdstr, rec["set"]))
+            state["t_cw"] = time.time()
+            SLEEP(AWG_SETTLE)
+            t_calc = time.time()
+            d1 = max(MIN_D1, POLARIZE_TIME - (t_calc - state["t_cw"]) - latency())
+        else:
+            t_calc = time.time()
+            d1 = rec["target"] - (t_calc - state["t_off"]) - latency()
+            if d1 < MIN_D1:
+                ops["log"]("expno %d: target t = %s s cannot be met (%.1f s late with D1 = %s s)"
+                           % (expno, rec["target"], MIN_D1 - d1, MIN_D1))
+                d1 = MIN_D1
+        d1 = round(d1, 3)
+        rec["d1"] = d1
+        ops["new_record"](expno, 1, d1, rec["title"])
+        t_fin = ops["acquire"](expno, 1, d1, rec["what"])
+        t_pulse = t_fin - aq_s(ops, expno)
+        state["lat"].append(t_pulse - t_calc - d1)
+        if rec["role"] == "ref":
+            if not ops["awg"]("stop"):
+                raise RunAbort("could not send 'stop' to the AWG after the reference record (expno %d)" % expno)
+            state["t_off"] = time.time()
+            rec["t"] = t_pulse - state["t_off"]
+            ops["log"]("set %d: microwave off ('stop'); the reference pulse came %.0f s after 'cw' "
+                       "and %.1f s before 'stop'" % (rec["set"], t_pulse - state["t_cw"], -rec["t"]))
+        else:
+            rec["t"] = t_pulse - state["t_off"]
+            ops["log"]("expno %d: pulse at t = %.1f s after the microwave went off (target %s s)"
+                       % (expno, rec["t"], rec["target"]))
+        return t_fin
+
+    run_records(c, {
+        "noun": "decay", "table": DECAY_SETTINGS, "make_plan": make_plan,
+        "dialog_rows": dialog_rows, "timing": timing, "header": header,
+        "used": {"FREQ": FREQ, "POWER": POWER, "POLARIZE_TIME": POLARIZE_TIME, "TIMES_LIST": targets,
+                 "FLIP_DEG": FLIP_DEG, "ZG_LATENCY": ZG_LATENCY, "MIN_D1": MIN_D1},
+        "settings_comments": settings_comments, "record_runner": runner, "row_extra": row_extra,
+        "d1_column": True, "on_noun": "ON records",
+        "start_desc": "%d set(s), %g s polarization, %d decay times per set" % (REPEATS, POLARIZE_TIME,
+                                                                              len(targets)),
+        "end_desc": "%d set(s), %d decay times per set" % (REPEATS, len(targets))}, source)
+
+
+def run_records(c, job, source):
+    """Acquires the records that job["make_plan"] lists, with the common settings in c
+    (see run_profile and run_buildup for job). Each record is made from the template
+    with wrpa, D1, NS and DS; before it, 'stop' (OFF) or its 'cw' command (ON) is sent
+    to the AWG."""
+    RUN_LABEL        = str(c["RUN_LABEL"]).strip()
+    SAMPLE           = c["SAMPLE"]
+    MAS_INFO         = c["MAS_INFO"]
+    DATA_DIR         = c["DATA_DIR"]
+    DATA_NAME        = c["DATA_NAME"]
+    START_EXPNO      = c["START_EXPNO"]
+    TEMPLATE_EXPNO   = c["TEMPLATE_EXPNO"]
+    DS               = c["DS"]
+    AWG_SETTLE       = c["AWG_SETTLE"]
+    SCAN_OVERHEAD    = c["SCAN_OVERHEAD"]
+    POLL_INTERVAL    = c["POLL_INTERVAL"]
+    MAX_EXTRA_WAIT   = c["MAX_EXTRA_WAIT"]
+    POST_ACQ_PAD     = c["POST_ACQ_PAD"]
+    EST_OVERHEAD     = c["EST_OVERHEAD"]
+    AWG_RETRIES      = c["AWG_RETRIES"]
+    MAX_CONSEC_SKIPS = c["MAX_CONSEC_SKIPS"]
+    PROCESS_CMDS     = list(c["PROCESS_CMDS"])
+    PEAK_PPM         = c["PEAK_PPM"]
+    PEAK_WINDOW_PPM  = c["PEAK_WINDOW_PPM"]
+    INTENSITY_MODE   = str(c["INTENSITY_MODE"]).strip().lower()
+    LAUNCH_VIEWER    = c["LAUNCH_VIEWER"]
+    RESPAWN_VIEWER   = c["RESPAWN_VIEWER"]
+    fail = failer(RUN_LABEL)
 
     # ---- Dataset and template: from the script, or else from TopSpin ----------
     def topspin_current():
@@ -383,24 +1141,9 @@ def run_profile(S, source=None):
         return ""
     tmpl_pulprog = acqus_param(TEMPLATE_EXPNO, "PULPROG")
 
-    # ---- Run plan: (expno, set, "OFF", label) / (expno, set, "ON", freq) -------
-    per_set = []
-    if OFF_MODE in ("start", "both"):
-        per_set.append(("OFF", "start"))
-    for f in freqs:
-        per_set.append(("ON", f))
-    if OFF_MODE in ("end", "both"):
-        per_set.append(("OFF", "end"))
-    points_per_set  = len(freqs)
-    records_per_set = len(per_set)
-    n_off_per_set   = records_per_set - points_per_set
-    plan = []
-    for set_number in range(1, REPEATS + 1):
-        base = START_EXPNO + (set_number - 1) * records_per_set
-        for i in range(records_per_set):
-            kind, val = per_set[i]
-            plan.append((base + i, set_number, kind, val))
-    planned_last = plan[-1][0]
+    # ---- Run plan: one dict per record, in acquisition order ---------------------
+    plan = job["make_plan"](START_EXPNO)
+    planned_last = plan[-1]["expno"]
 
     n_records = len(plan)
 
@@ -470,24 +1213,13 @@ def run_profile(S, source=None):
             ERRMSG("Could not display confirmation dialog: %s" % ex)
             return False
 
-    def record_time(ns):
-        return AWG_SETTLE + EST_OVERHEAD + (ns + DS) * (D1 + SCAN_OVERHEAD) + POST_ACQ_PAD
+    def record_time(ns, d1):
+        return AWG_SETTLE + EST_OVERHEAD + (ns + DS) * (d1 + SCAN_OVERHEAD) + POST_ACQ_PAD
 
-    per_point_time = record_time(PROFILE_NS)
-    off_time       = record_time(OFF_SCANS)
-    total_time     = REPEATS * (per_point_time * points_per_set + off_time * n_off_per_set)
+    total_time, time_note = job["timing"](plan, record_time)
 
     # ---- Confirmation --------------------------------------------------------
-    def fmt_dur(sec):
-        sec = int(round(sec))
-        if sec >= 3600:
-            return "%d h %02d min" % (sec // 3600, (sec % 3600) // 60)
-        if sec >= 60:
-            return "%d min %02d s" % (sec // 60, sec % 60)
-        return "%d s" % sec
-
-    def h(x):
-        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    h = html_text
 
     if PEAK_PPM is None:
         window_desc = "whole spectrum"
@@ -502,33 +1234,7 @@ def run_profile(S, source=None):
     else:
         viewer_desc = "opens automatically"
 
-    def set_line(set_number):
-        recs = [p for p in plan if p[1] == set_number]
-        offs = [p[0] for p in recs if p[2] == "OFF"]
-        ons  = [p[0] for p in recs if p[2] == "ON"]
-        parts = []
-        if OFF_MODE in ("start", "both"):
-            parts.append("OFF %d" % offs[0])
-        parts.append("ON %d&#8211;%d" % (ons[0], ons[-1]))
-        if OFF_MODE in ("end", "both"):
-            parts.append("OFF %d" % offs[-1])
-        pre = ("set %d: " % set_number) if REPEATS > 1 else ""
-        return pre + ", then ".join(parts)
 
-    shown = list(range(1, REPEATS + 1))
-    if REPEATS > 6:
-        shown = [1, 2, 3, None, REPEATS]
-    plan_html = "<br>".join([("..." if n is None else set_line(n)) for n in shown])
-
-    sf = sorted(freqs)
-    gaps = [round((b - a) * 1000.0, 3) for a, b in zip(sf[:-1], sf[1:])]
-    if not gaps:
-        spacing = ""
-    elif min(gaps) == max(gaps):
-        spacing = ", %g MHz apart" % gaps[0]
-    else:
-        spacing = ", %g&#8211;%g MHz apart" % (min(gaps), max(gaps))
-    freq_html = "%d per set, %.3f&#8211;%.3f GHz%s" % (points_per_set, sf[0], sf[-1], spacing)
     t_end = time.time() + total_time
     if time.strftime("%Y%m%d", time.localtime(t_end)) == time.strftime("%Y%m%d"):
         end_str = time.strftime("%H:%M", time.localtime(t_end))
@@ -538,7 +1244,7 @@ def run_profile(S, source=None):
     big = "<span style='font-size:17pt'><b>%s</b></span>"
     summary = (
         "<html><body style='width:640px'>"
-        "<p><span style='font-size:14pt'><b>Start the '%s' frequency profile?</b></span></p>"
+        "<p><span style='font-size:14pt'><b>Start the '%s' %s?</b></span></p>"
         "<table cellpadding='5' cellspacing='0' bgcolor='#e8eef8' width='100%%'>"
         "<tr><td valign='top' width='100' nowrap>Dataset</td><td>%s<br>%s</td></tr>"
         "<tr><td valign='top' width='100' nowrap>New expnos</td><td>%s<br>%s</td></tr>"
@@ -546,11 +1252,16 @@ def run_profile(S, source=None):
         "</table>"
         "<table cellpadding='3' cellspacing='0'>"
         "<tr><td valign='top' width='100' nowrap><b>Sample</b></td><td>%s<br>%s</td></tr>"
-        "<tr><td valign='top'><b>Plan</b></td><td>%s</td></tr>"
-        "<tr><td valign='top'><b>Frequencies</b></td><td>%s</td></tr>"
-        "<tr><td valign='top'><b>Scans</b></td><td>ON records NS %d, OFF records NS %d; "
-        "D1 %s s, DS %d; power %.2f</td></tr>"
-        "<tr><td valign='top'><b>Time</b></td><td><b>about %s</b>, ending around %s<br>%s</td></tr>"
+        % (h(RUN_LABEL), job["noun"],
+           big % h(ds_root), grey % h(ds_from),
+           big % ("%d &#8211; %d" % (START_EXPNO, planned_last)),
+           grey % ("%d records, none of them exists yet" % n_records),
+           big % ("expno %d" % TEMPLATE_EXPNO) + ("&nbsp;&nbsp;%s" % h(tmpl_pulprog) if tmpl_pulprog else ""),
+           grey % h(tmpl_from),
+           h(SAMPLE), grey % h(MAS_INFO))
+        + "".join(["<tr><td valign='top'><b>%s</b></td><td>%s</td></tr>" % (k, v)
+                   for k, v in job["dialog_rows"](plan)])
+        + "<tr><td valign='top'><b>Time</b></td><td><b>about %s</b>, ending around %s<br>%s</td></tr>"
         "<tr><td valign='top'><b>Records</b></td><td>%s</td></tr>"
         "<tr><td valign='top'><b>Live plot</b></td><td>%s, %s; the viewer %s</td></tr>"
         "</table>"
@@ -558,18 +1269,7 @@ def run_profile(S, source=None):
         "<p style='margin-top:10px'><span style='font-size:13pt'><b>OK</b> starts the run. "
         "<b>Cancel</b> creates nothing.</span></p>"
         "</body></html>"
-        % (h(RUN_LABEL),
-           big % h(ds_root), grey % h(ds_from),
-           big % ("%d &#8211; %d" % (START_EXPNO, planned_last)),
-           grey % ("%d records, none of them exists yet" % n_records),
-           big % ("expno %d" % TEMPLATE_EXPNO) + ("&nbsp;&nbsp;%s" % h(tmpl_pulprog) if tmpl_pulprog else ""),
-           grey % h(tmpl_from),
-           h(SAMPLE), grey % h(MAS_INFO),
-           plan_html, freq_html,
-           PROFILE_NS, OFF_SCANS, h(D1), DS, POWER,
-           fmt_dur(total_time), end_str,
-           grey % ("ON ~%s per point, OFF ~%s each" % (fmt_dur(per_point_time), fmt_dur(off_time))
-                   if n_off_per_set else "ON ~%s per point" % fmt_dur(per_point_time)),
+        % (fmt_dur(total_time), end_str, grey % time_note,
            h(os.path.join(ds_root, RUNS_SUBDIR, "<start time>_%s_e%d" % (RUN_LABEL, START_EXPNO))),
            h(window_desc), h(INTENSITY_MODE), viewer_desc,
            grey % ("Timing: scan ~ D1 + %s s; poll every %s s; stop if a record runs %s s past its "
@@ -598,9 +1298,10 @@ def run_profile(S, source=None):
     VIEWER_LOG = os.path.join(run_dir, "viewer.log")
     paths["log"] = os.path.join(run_dir, "log.txt")
     used = dict(c)
+    used.update(job["used"])
     used.update(RUN_LABEL=RUN_LABEL, DATA_DIR=DATA_DIR, DATA_NAME=DATA_NAME,
-                TEMPLATE_EXPNO=TEMPLATE_EXPNO, START_EXPNO=START_EXPNO, OFF_MODE=OFF_MODE,
-                INTENSITY_MODE=INTENSITY_MODE, FREQS=freqs, PROCESS_CMDS=PROCESS_CMDS)
+                TEMPLATE_EXPNO=TEMPLATE_EXPNO, START_EXPNO=START_EXPNO,
+                INTENSITY_MODE=INTENSITY_MODE, PROCESS_CMDS=PROCESS_CMDS)
     try:
         fh = open(os.path.join(run_dir, "settings.txt"), "w")
         try:
@@ -609,7 +1310,9 @@ def run_profile(S, source=None):
             fh.write("# template: expno %d (%s), %s\n" % (TEMPLATE_EXPNO, tmpl_pulprog or "?", tmpl_from))
             fh.write("# expnos: %d..%d\n" % (START_EXPNO, planned_last))
             fh.write("# settings file: %s\n" % (source or "-"))
-            for n, d in SETTINGS:
+            for line in job["settings_comments"](plan, record_time):
+                fh.write(line + "\n")
+            for n, d in job["table"]:
                 fh.write("%s = %r\n" % (n, used[n]))
         finally:
             fh.close()
@@ -635,33 +1338,20 @@ def run_profile(S, source=None):
             log("Could not write run file %s [%s]" % (RUN_PATH, ex))
 
     def run_file_header():
-        run_file_write(
-            "# fs run file (read by fs_plot.py and fs_rephase.py)\n"
-            "# run_id = %s\n"
-            "# label = %s\n"
-            "# sample = %s\n"
-            "# conditions = %s\n"
-            "# dataset_dir = %s\n"
-            "# off_mode = %s\n"
-            "# peak_ppm = %s\n"
-            "# window_ppm = %s\n"
-            "# mode = %s\n"
-            "# power = %.2f\n"
-            "# d1 = %s\n"
-            "# repeats = %d\n"
-            "# started = %s\n"
-            "# columns: expno, kind, label, freq_GHz, ns, finished, set\n"
-            % (run_id, RUN_LABEL, SAMPLE, MAS_INFO, ds_root, OFF_MODE, peak_str,
-               repr(float(PEAK_WINDOW_PPM)), INTENSITY_MODE, POWER, D1, REPEATS, now_str()),
-            'w')
+        run_file_write(job["header"](run_id, ds_root, peak_str, now_str()), 'w')
 
-    def run_file_row(expno, kind, label, freq, ns, t_fin, set_number):
-        if freq is None:
+    def run_file_row(rec, t_fin):
+        if rec["freq"] is None:
             fstr = "-"
         else:
-            fstr = "%.4f" % freq
-        run_file_write("%d\t%s\t%s\t%s\t%d\t%s\t%d\n"
-                       % (expno, kind, label, fstr, ns, now_str(t_fin), set_number))
+            fstr = "%.4f" % rec["freq"]
+        line = ("%d\t%s\t%s\t%s\t%d\t%s\t%d"
+                % (rec["expno"], rec["kind"], rec["label"], fstr, rec["ns"], now_str(t_fin), rec["set"]))
+        if job["d1_column"]:
+            line += "\t%s" % rec["d1"]
+        if job.get("row_extra"):
+            line += job["row_extra"](rec)
+        run_file_write(line + "\n")
 
     def clean(x):
         return str(x).replace("\t", " ").replace("\n", " ")
@@ -702,11 +1392,11 @@ def run_profile(S, source=None):
         except CATCH:
             pass
 
-    def new_record(expno, ns, title):
+    def new_record(expno, ns, d1, title):
         re_abs(TEMPLATE_EXPNO)
         XCMD("wrpa " + str(expno), wait=WAIT_TILL_DONE)
         re_abs(expno)
-        XCMD("d1 " + str(D1))
+        XCMD("d1 " + str(d1))
         XCMD("ns " + str(ns))
         XCMD("ds " + str(DS))
         set_title(expno, title)
@@ -749,14 +1439,14 @@ def run_profile(S, source=None):
         except CATCH as ex:
             log("expno %d: processing failed (%s)  [%s]" % (expno, "; ".join(PROCESS_CMDS), ex))
 
-    def acquire(expno, ns, label):
+    def acquire(expno, ns, d1, label):
         """Start zg and return only once the acquisition has finished.
         Raises RunAbort if it has not finished MAX_EXTRA_WAIT s past the expected end."""
-        lower    = (ns + DS) * D1                       # hard lower bound on the duration
-        expected = (ns + DS) * (D1 + SCAN_OVERHEAD)
+        lower    = (ns + DS) * d1                       # hard lower bound on the duration
+        expected = (ns + DS) * (d1 + SCAN_OVERHEAD)
         t_zg = time.time()
         log("expno %d: zg  [%s, NS=%d, DS=%d, D1=%s s, expected ~%d s]"
-            % (expno, label, ns, DS, D1, expected))
+            % (expno, label, ns, DS, d1, expected))
         XCMD("zg", wait=WAIT_TILL_DONE)
         t_ret = time.time()
         if t_zg + lower > t_ret:
@@ -779,31 +1469,19 @@ def run_profile(S, source=None):
                     % (expno, label, int(round(time.time() - t_zg)), expected))
             SLEEP(POLL_INTERVAL)
 
-    def set_tag(set_number):
-        return ("set %d | " % set_number) if REPEATS > 1 else ""
-
-    def run_off(expno, set_number, label):
-        if not awg('stop'):
-            raise RunAbort("could not send 'stop' to the AWG before the %sOFF %s (expno %d)"
-                           % (set_tag(set_number), label, expno))
-        SLEEP(AWG_SETTLE)
-        title = ("OFF (%s) | %s%s | %s | microwave off | D1 = %s s | %d scans"
-                 % (label, set_tag(set_number), SAMPLE, MAS_INFO, D1, OFF_SCANS))
-        new_record(expno, OFF_SCANS, title)
-        return acquire(expno, OFF_SCANS, "%sOFF %s" % (set_tag(set_number), label))
-
-    def run_on(expno, set_number, freq):
-        """Returns the finish time if the point was acquired, None if the AWG
-        could not be set (point skipped, expno left empty)."""
-        cmdstr = 'cw %.3f %.2f' % (freq, POWER)
-        if not awg(cmdstr):
+    def run_record(rec):
+        """Sets the AWG and acquires the record. Returns the finish time, or None if the
+        'cw' command of an ON record could not be sent (record skipped, expno left
+        empty); a failed 'stop' before an OFF record stops the run."""
+        if rec["kind"] == "OFF":
+            if not awg('stop'):
+                raise RunAbort("could not send 'stop' to the AWG before the %s (expno %d)"
+                               % (rec["what"], rec["expno"]))
+        elif not awg(rec["awg"]):
             return None
         SLEEP(AWG_SETTLE)
-        title = ("freq profile | %s%s | %s | %s | D1 = %s s | %d scan(s)"
-                 % (set_tag(set_number), SAMPLE, MAS_INFO, cmdstr, D1, PROFILE_NS))
-        new_record(expno, PROFILE_NS, title)
-        return acquire(expno, PROFILE_NS, "%sON %.3f GHz" % (set_tag(set_number), freq))
-
+        new_record(rec["expno"], rec["ns"], rec["d1"], rec["title"])
+        return acquire(rec["expno"], rec["ns"], rec["d1"], rec["what"])
     # ---- Viewer -------------------------------------------------------------------
     def launch_viewer():
         """Start fs_plot.py detached from TopSpin, with the Python variables of
@@ -876,10 +1554,9 @@ def run_profile(S, source=None):
                 % ex)
 
     # ---- Main loop over the plan -------------------------------------------------
-    log("=== %s start: %s / %s, %d set(s), OFF mode %s, %d ON points per set, "
-        "expno %d..%d, estimated %s ===" % (RUN_LABEL, DATA_NAME, DATA_DIR, REPEATS, OFF_MODE,
-                                            points_per_set, START_EXPNO, planned_last,
-                                            fmt_hms(total_time)))
+    log("=== %s start: %s / %s, %s, expno %d..%d, estimated %s ==="
+        % (RUN_LABEL, DATA_NAME, DATA_DIR, job["start_desc"], START_EXPNO, planned_last,
+           fmt_hms(total_time)))
     log("Run folder: %s" % run_dir)
     run_file_header()
     index_event("start", "running")
@@ -906,29 +1583,32 @@ def run_profile(S, source=None):
     plan_done = False
 
     try:
-        for expno, set_number, kind, val in plan:
-            if kind == "OFF":
-                t_fin = run_off(expno, set_number, val)
-                run_file_row(expno, "OFF", val, None, OFF_SCANS, t_fin, set_number)
+        ops = {"awg": awg, "new_record": new_record, "acquire": acquire, "log": log,
+               "acqus_param": acqus_param}
+        for rec in plan:
+            expno = rec["expno"]
+            if job.get("record_runner"):          # decay: its own AWG and D1 timing
+                t_fin = job["record_runner"](rec, ops)
+            else:
+                t_fin = run_record(rec)
+            if rec["kind"] == "OFF":
+                run_file_row(rec, t_fin)
                 respawn_viewer(expno)
                 n_off_done += 1
                 last_expno = expno
+            elif t_fin is not None:
+                run_file_row(rec, t_fin)
+                respawn_viewer(expno)
+                n_on_done += 1
+                last_expno = expno
+                consec_skips = 0
             else:
-                t_fin = run_on(expno, set_number, val)
-                if t_fin is not None:
-                    run_file_row(expno, "ON", "on", val, PROFILE_NS, t_fin, set_number)
-                    respawn_viewer(expno)
-                    n_on_done += 1
-                    last_expno = expno
-                    consec_skips = 0
-                else:
-                    skipped.append((set_number, val, expno))
-                    consec_skips += 1
-                    log("Skipped %s%.3f GHz (expno %d left empty)"
-                        % (set_tag(set_number), val, expno))
-                    if consec_skips >= MAX_CONSEC_SKIPS:
-                        raise RunAbort("%d ON points in a row could not be set on the AWG "
-                                       "(last: %.3f GHz)" % (consec_skips, val))
+                skipped.append((rec["set"], rec["freq"], expno))
+                consec_skips += 1
+                log("Skipped %s (expno %d left empty)" % (rec["skip"], expno))
+                if consec_skips >= MAX_CONSEC_SKIPS:
+                    raise RunAbort("%d %s in a row could not be set on the AWG "
+                                   "(last: %s)" % (consec_skips, job["on_noun"], rec["last"]))
         plan_done = True
     except RunAbort as ex:
         abort_reason = str(ex)
@@ -967,5 +1647,5 @@ def run_profile(S, source=None):
         ERRMSG("%s finished, but the final 'stop' could not be sent - CHECK THE SOURCE.\n"
                "%s.\nRun folder: %s" % (RUN_LABEL, done, run_dir))
     else:
-        MSG("%s complete: %d set(s), OFF mode %s. %s. 'stop' sent to AWG.\nRun folder: %s\n"
-            "Plot: %s" % (RUN_LABEL, REPEATS, OFF_MODE, done, run_dir, viewer_cmd))
+        MSG("%s complete: %s. %s. 'stop' sent to AWG.\nRun folder: %s\n"
+            "Plot: %s" % (RUN_LABEL, job["end_desc"], done, run_dir, viewer_cmd))
