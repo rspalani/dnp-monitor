@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-fs_core.py  -  shared acquisition code for the DNP frequency-profile scripts
-(TopSpin / Jython)
+fs_core.py  -  shared acquisition code for the DNP frequency-profile, build-up,
+and decay scripts (TopSpin / Jython)
 
 Not run directly. The TopSpin script fs.py (in TopSpin's py/user folder) runs
     execfile("/opt/dnptools/fs_core.py")
@@ -94,6 +94,24 @@ Template, expno checks, timing, run folder, index and viewer are as for a
 profile. The run folder is in fs_runs as well, labelled bu_<name> unless
 RUN_LABEL is set; run.txt has '# type = buildup' and an eighth column with D1
 (s), and settings.txt lists every planned record with its expected duration.
+
+Decay runs (TopSpin script decay.py): 'decay p1' runs decay_p1.py, 'decay' alone
+lists the decay_*.py files, and decay_template.py is the template. Each set
+(REPEATS) sends 'cw FREQ POWER', waits so that the reference pulse comes
+POLARIZE_TIME s after 'cw', acquires the reference record with the microwaves on,
+sends 'stop' (t = 0), and then acquires one record at each target time in
+TIMES_LIST. Every record has NS 1 and DS 0; the pulse program must not saturate,
+and its pulse should be a small flip angle (FLIP_DEG, written to run.txt for the
+viewer, which corrects for the polarization each pulse uses). The D1 of a decay
+record is set when the record is set up:
+    D1 = target - (now - t_off) - latency
+where latency, the time from setting D1 to the pulse besides D1, is the median of
+those measured on the records so far (pulse time = end of acquisition, the mtime
+of audita.txt, less AQ = TD/(2*SW_h)), ZG_LATENCY before the first measurement.
+A D1 below MIN_D1 is raised to it, so the record comes late; this is logged, and
+the time actually reached is recorded. run.txt has '# type = decay', the flip
+angle, and three more columns: D1 (s), t (s after 'stop'; negative for the
+reference), and the target time.
 """
 import math
 import os
@@ -197,6 +215,41 @@ BU_SETTINGS = [
     ("PEAK_PPM",         None),       # None = whole spectrum
     ("PEAK_WINDOW_PPM",  10.0),
     ("INTENSITY_MODE",   "extreme"),  # "extreme", "max" or "sum"
+    ("LAUNCH_VIEWER",    True),
+    ("RESPAWN_VIEWER",   True),
+]
+
+
+# Decay runs (decay.py): polarize with the microwaves on, one reference record, microwaves
+# off, then one record (NS 1) at each target time after the microwaves went off
+DECAY_SETTINGS = [
+    ("RUN_LABEL",        REQUIRED),   # default: decay_<name> of decay_<name>.py
+    ("SAMPLE",           ""),
+    ("MAS_INFO",         ""),
+    ("DATA_DIR",         ""),
+    ("DATA_NAME",        ""),
+    ("START_EXPNO",      REQUIRED),
+    ("TEMPLATE_EXPNO",   None),
+    ("REPEATS",          1),          # polarize-and-decay cycles, one after the other
+    ("FREQ",             REQUIRED),   # GHz, while polarizing
+    ("POWER",            REQUIRED),   # second argument of 'cw'
+    ("POLARIZE_TIME",    REQUIRED),   # s from 'cw' to the reference pulse
+    ("TIMES_LIST",       REQUIRED),   # s after the microwaves go off, increasing: one record each
+    ("FLIP_DEG",         5.0),        # flip angle of the template's pulse (for the viewer's correction)
+    ("ZG_LATENCY",       3.0),        # s from setting D1 to the pulse, besides D1 (first guess;
+                                      # then measured on each record)
+    ("MIN_D1",           0.5),        # s; a target that comes sooner is taken late, with this D1
+    ("AWG_SETTLE",       2),
+    ("SCAN_OVERHEAD",    5),
+    ("POLL_INTERVAL",    1),
+    ("MAX_EXTRA_WAIT",   300),
+    ("POST_ACQ_PAD",     0),
+    ("EST_OVERHEAD",     5),
+    ("AWG_RETRIES",      3),
+    ("PROCESS_CMDS",     ["efp", "absn"]),
+    ("PEAK_PPM",         None),
+    ("PEAK_WINDOW_PPM",  10.0),
+    ("INTENSITY_MODE",   "extreme"),
     ("LAUNCH_VIEWER",    True),
     ("RESPAWN_VIEWER",   True),
 ]
@@ -318,6 +371,11 @@ def run_buildup_settings(args=None):
     run_from_args(args, "bu", "buildup_", "bu_", run_buildup)
 
 
+def run_decay_settings(args=None):
+    """Entry point of decay.py. args: the words after 'decay' on TopSpin's command line."""
+    run_from_args(args, "decay", "decay_", "decay_", run_decay)
+
+
 def run_from_args(args, cmd, prefix, label_prefix, runner):
     """Finds and reads the settings file named in args (or chosen from a list) and runs it
     with runner; RUN_LABEL defaults to label_prefix + <name> of <prefix><name>.py."""
@@ -389,7 +447,9 @@ def run_profile(S, source=None):
     """Runs the profile described by the settings dict S; source: the settings file, if any."""
     # ---- Settings ------------------------------------------------------------
     c = check_settings(S, SETTINGS, "This looks like a build-up settings file: run it with 'bu'"
-                       if ("D1_LIST" in S or "SERIES" in S) else "")
+                       if ("D1_LIST" in S or "SERIES" in S) else
+                       "This looks like a decay settings file: run it with 'decay'"
+                       if ("TIMES_LIST" in S or "POLARIZE_TIME" in S) else "")
     if c is None:
         return
     RUN_LABEL        = str(c["RUN_LABEL"]).strip()
@@ -545,7 +605,9 @@ def run_buildup(S, source=None):
     """Runs the build-up described by the settings dict S; source: the settings file, if any."""
     # ---- Settings ------------------------------------------------------------
     c = check_settings(S, BU_SETTINGS, "This looks like a frequency-profile settings file: run it "
-                       "with 'fs'" if ("FREQS" in S or "OFF_MODE" in S) else "")
+                       "with 'fs'" if ("FREQS" in S or "OFF_MODE" in S) else
+                       "This looks like a decay settings file: run it with 'decay'"
+                       if ("TIMES_LIST" in S or "POLARIZE_TIME" in S) else "")
     if c is None:
         return
     RUN_LABEL        = str(c["RUN_LABEL"]).strip()
@@ -752,6 +814,228 @@ def run_buildup(S, source=None):
         "d1_column": True, "on_noun": "ON records",
         "start_desc": "%d set(s), series %s, %d build-up times per set" % (REPEATS, SERIES, n),
         "end_desc": "%d set(s), series %s" % (REPEATS, SERIES)}, source)
+
+
+def run_decay(S, source=None):
+    """Runs the decay described by the settings dict S; source: the settings file, if any.
+    Per set: 'cw' and POLARIZE_TIME s of polarization, ending with a reference record (ON,
+    NS 1); 'stop'; then one record (OFF, NS 1) per target time after the microwaves went off,
+    each with the D1 that brings its pulse to that time."""
+    # ---- Settings ------------------------------------------------------------
+    c = check_settings(S, DECAY_SETTINGS, "This looks like a frequency-profile or build-up settings "
+                       "file: run it with 'fs' or 'bu'" if ("FREQS" in S or "D1_LIST" in S) else "")
+    if c is None:
+        return
+    RUN_LABEL        = str(c["RUN_LABEL"]).strip()
+    SAMPLE           = c["SAMPLE"]
+    MAS_INFO         = c["MAS_INFO"]
+    REPEATS          = c["REPEATS"]
+    INTENSITY_MODE   = str(c["INTENSITY_MODE"]).strip().lower()
+    AWG_SETTLE       = c["AWG_SETTLE"]
+    fail = failer(RUN_LABEL)
+
+    if not re.match(r"^[A-Za-z0-9_-]+$", RUN_LABEL):
+        fail("RUN_LABEL may contain only letters, digits, '-' and '_' (got '%s')." % RUN_LABEL)
+        return
+    if INTENSITY_MODE not in ("extreme", "max", "sum"):
+        fail("INTENSITY_MODE must be 'extreme', 'max' or 'sum' (got '%s')." % INTENSITY_MODE)
+        return
+    if not isinstance(REPEATS, int) or REPEATS < 1:
+        fail("REPEATS must be a positive integer.")
+        return
+    nums = {}
+    for name in ("FREQ", "POWER", "POLARIZE_TIME", "FLIP_DEG", "ZG_LATENCY", "MIN_D1"):
+        try:
+            nums[name] = float(c[name])
+        except CATCH:
+            fail("%s must be a number (got %r)." % (name, c[name]))
+            return
+    FREQ, POWER, POLARIZE_TIME = nums["FREQ"], nums["POWER"], nums["POLARIZE_TIME"]
+    FLIP_DEG, ZG_LATENCY, MIN_D1 = nums["FLIP_DEG"], nums["ZG_LATENCY"], nums["MIN_D1"]
+    if POLARIZE_TIME <= 0:
+        fail("POLARIZE_TIME must be positive.")
+        return
+    if not 0 < FLIP_DEG < 180:
+        fail("FLIP_DEG must be between 0 and 180 (got %s)." % FLIP_DEG)
+        return
+
+    def num(x):
+        v = float(x)
+        return int(v) if v == int(v) else v
+    try:
+        targets = [num(x) for x in c["TIMES_LIST"]]
+    except CATCH:
+        fail("TIMES_LIST must be a list of times in s after the microwaves go off.")
+        return
+    if not targets:
+        fail("TIMES_LIST is empty.")
+        return
+    if min(targets) <= 0 or [t for a, t in zip(targets[:-1], targets[1:]) if t <= a]:
+        fail("TIMES_LIST must hold positive times in increasing order.")
+        return
+    cmdstr = 'cw %.3f %.2f' % (FREQ, POWER)
+    c = dict(c, DS=0, MAX_CONSEC_SKIPS=1)        # the engine's settings that decays do not have
+    rec_s = c["EST_OVERHEAD"] + c["SCAN_OVERHEAD"] + c["POST_ACQ_PAD"]   # s per record besides D1
+
+    def set_tag(set_number):
+        return ("set %d | " % set_number) if REPEATS > 1 else ""
+
+    def make_plan(start_expno):
+        plan = []
+        per_set = len(targets) + 1
+        for set_number in range(1, REPEATS + 1):
+            base = start_expno + (set_number - 1) * per_set
+            tag = set_tag(set_number)
+            plan.append({
+                "expno": base, "set": set_number, "kind": "ON", "label": "ref", "freq": FREQ,
+                "d1": num(POLARIZE_TIME), "ns": 1, "awg": cmdstr, "role": "ref", "target": 0,
+                "title": ("decay reference | %s%s | %s | %s | %g s polarization | 1 scan"
+                          % (tag, SAMPLE, MAS_INFO, cmdstr, POLARIZE_TIME)),
+                "what": "%sreference after %g s with '%s'" % (tag, POLARIZE_TIME, cmdstr),
+                "skip": "", "last": ""})
+            for j, t in enumerate(targets):
+                plan.append({
+                    "expno": base + 1 + j, "set": set_number, "kind": "OFF", "label": "decay", "freq": None,
+                    "d1": t, "ns": 1, "awg": None, "role": "decay", "target": t,
+                    "title": ("decay | %s%s | %s | microwave off | t = %s s after it went off | 1 scan"
+                              % (tag, SAMPLE, MAS_INFO, t)),
+                    "what": "%sdecay t = %s s" % (tag, t)})
+        return plan
+
+    def expected(p):
+        """Expected duration of a record, for the time estimate and the viewer's expected end."""
+        if p["role"] == "ref":
+            return POLARIZE_TIME + AWG_SETTLE + rec_s
+        i = targets.index(p["target"])
+        return max(p["target"] - (targets[i - 1] if i else 0), MIN_D1 + rec_s)
+
+    def dialog_rows(plan):
+        shown = list(range(1, REPEATS + 1))
+        if REPEATS > 6:
+            shown = [1, 2, 3, None, REPEATS]
+        lines = []
+        for k in shown:
+            if k is None:
+                lines.append("...")
+                continue
+            recs = [p for p in plan if p["set"] == k]
+            lines.append("%sreference %d, then decay %d&#8211;%d"
+                         % (("set %d: " % k) if REPEATS > 1 else "", recs[0]["expno"], recs[1]["expno"],
+                            recs[-1]["expno"]))
+        gaps = [b - a for a, b in zip([0] + targets[:-1], targets)]
+        tight = [t for t, g in zip(targets, gaps) if g < rec_s + MIN_D1 + ZG_LATENCY]
+        tx = ", ".join(["%s" % t for t in targets])
+        if tight:
+            tx += ("<br><font color='#a04000'>%d target(s) less than about %d s after the one before "
+                   "(%s s): each comes as soon as the record before it is done</font>"
+                   % (len(tight), int(rec_s + MIN_D1 + ZG_LATENCY), ", ".join(["%s" % t for t in tight])))
+        return [("Plan", "<br>".join(lines)),
+                ("mm-wave", "AWG '%s', reference record after %g s (%s), then 'stop'"
+                 % (cmdstr, POLARIZE_TIME, fmt_dur(POLARIZE_TIME))),
+                ("Times", "%d per set, s after the microwaves go off: %s" % (len(targets), tx)),
+                ("Scans", "NS 1, DS 0 on every record; D1 set for each record to reach its time. "
+                          "Flip angle %g&#176; (from the template; for the viewer's correction); "
+                          "no saturation in the pulse program." % FLIP_DEG)]
+
+    def timing(plan, record_time):
+        total = sum([expected(p) for p in plan])
+        return total, ("per set: %s polarizing, then %s of decay"
+                       % (fmt_dur(POLARIZE_TIME), fmt_dur(targets[-1])))
+
+    def header(run_id, ds_root, peak_str, started):
+        return ("# fs run file (read by fs_plot.py and fs_rephase.py)\n"
+                "# type = decay\n"
+                "# run_id = %s\n"
+                "# label = %s\n"
+                "# sample = %s\n"
+                "# conditions = %s\n"
+                "# dataset_dir = %s\n"
+                "# freq_GHz = %.4f\n"
+                "# power = %.2f\n"
+                "# polarize_s = %s\n"
+                "# flip_deg = %s\n"
+                "# peak_ppm = %s\n"
+                "# window_ppm = %s\n"
+                "# mode = %s\n"
+                "# repeats = %d\n"
+                "# started = %s\n"
+                "# t_s: time of the record's pulse after the microwaves went off (end of acquisition\n"
+                "#      less AQ); target_s: the time aimed at\n"
+                "# columns: expno, kind, label, freq_GHz, ns, finished, set, d1_s, t_s, target_s\n"
+                % (run_id, RUN_LABEL, SAMPLE, MAS_INFO, ds_root, FREQ, POWER, POLARIZE_TIME, FLIP_DEG,
+                   peak_str, repr(float(c["PEAK_WINDOW_PPM"])), INTENSITY_MODE, REPEATS, started))
+
+    def settings_comments(plan, record_time):
+        out = ["# planned records (expno, set, kind, D1 or target s, NS, expected s; read by fs_plot.py):"]
+        for p in plan:
+            out.append("# record: %d %d %s %s %d %d" % (p["expno"], p["set"], p["kind"], p["d1"], 1,
+                                                        int(round(expected(p)))))
+        return out
+
+    def row_extra(rec):
+        return "\t%.3f\t%s" % (rec.get("t", float("nan")), rec["target"])
+
+    state = {"t_cw": None, "t_off": None, "lat": []}
+
+    def latency():
+        lat = sorted(state["lat"])
+        if not lat:
+            return ZG_LATENCY
+        return lat[len(lat) // 2]
+
+    def aq_s(ops, expno):
+        try:
+            return float(ops["acqus_param"](expno, "TD")) / (2.0 * float(ops["acqus_param"](expno, "SW_h")))
+        except CATCH:
+            return 0.0
+
+    def runner(rec, ops):
+        """Acquires one record of a decay: the reference ('cw', polarization, record, 'stop'),
+        or a decay record with the D1 that brings its pulse to its target time."""
+        expno = rec["expno"]
+        if rec["role"] == "ref":
+            if not ops["awg"](cmdstr):
+                raise RunAbort("could not send '%s' to the AWG to polarize (set %d)" % (cmdstr, rec["set"]))
+            state["t_cw"] = time.time()
+            SLEEP(AWG_SETTLE)
+            t_calc = time.time()
+            d1 = max(MIN_D1, POLARIZE_TIME - (t_calc - state["t_cw"]) - latency())
+        else:
+            t_calc = time.time()
+            d1 = rec["target"] - (t_calc - state["t_off"]) - latency()
+            if d1 < MIN_D1:
+                ops["log"]("expno %d: target t = %s s cannot be met (%.1f s late with D1 = %s s)"
+                           % (expno, rec["target"], MIN_D1 - d1, MIN_D1))
+                d1 = MIN_D1
+        d1 = round(d1, 3)
+        rec["d1"] = d1
+        ops["new_record"](expno, 1, d1, rec["title"])
+        t_fin = ops["acquire"](expno, 1, d1, rec["what"])
+        t_pulse = t_fin - aq_s(ops, expno)
+        state["lat"].append(t_pulse - t_calc - d1)
+        if rec["role"] == "ref":
+            if not ops["awg"]("stop"):
+                raise RunAbort("could not send 'stop' to the AWG after the reference record (expno %d)" % expno)
+            state["t_off"] = time.time()
+            rec["t"] = t_pulse - state["t_off"]
+            ops["log"]("set %d: microwave off ('stop'); the reference pulse came %.0f s after 'cw' "
+                       "and %.1f s before 'stop'" % (rec["set"], t_pulse - state["t_cw"], -rec["t"]))
+        else:
+            rec["t"] = t_pulse - state["t_off"]
+            ops["log"]("expno %d: pulse at t = %.1f s after the microwave went off (target %s s)"
+                       % (expno, rec["t"], rec["target"]))
+        return t_fin
+
+    run_records(c, {
+        "noun": "decay", "table": DECAY_SETTINGS, "make_plan": make_plan,
+        "dialog_rows": dialog_rows, "timing": timing, "header": header,
+        "used": {"FREQ": FREQ, "POWER": POWER, "POLARIZE_TIME": POLARIZE_TIME, "TIMES_LIST": targets,
+                 "FLIP_DEG": FLIP_DEG, "ZG_LATENCY": ZG_LATENCY, "MIN_D1": MIN_D1},
+        "settings_comments": settings_comments, "record_runner": runner, "row_extra": row_extra,
+        "d1_column": True, "on_noun": "ON records",
+        "start_desc": "%d set(s), %g s polarization, %d decay times per set" % (REPEATS, POLARIZE_TIME,
+                                                                              len(targets)),
+        "end_desc": "%d set(s), %d decay times per set" % (REPEATS, len(targets))}, source)
 
 
 def run_records(c, job, source):
@@ -1065,6 +1349,8 @@ def run_records(c, job, source):
                 % (rec["expno"], rec["kind"], rec["label"], fstr, rec["ns"], now_str(t_fin), rec["set"]))
         if job["d1_column"]:
             line += "\t%s" % rec["d1"]
+        if job.get("row_extra"):
+            line += job["row_extra"](rec)
         run_file_write(line + "\n")
 
     def clean(x):
@@ -1297,9 +1583,14 @@ def run_records(c, job, source):
     plan_done = False
 
     try:
+        ops = {"awg": awg, "new_record": new_record, "acquire": acquire, "log": log,
+               "acqus_param": acqus_param}
         for rec in plan:
             expno = rec["expno"]
-            t_fin = run_record(rec)
+            if job.get("record_runner"):          # decay: its own AWG and D1 timing
+                t_fin = job["record_runner"](rec, ops)
+            else:
+                t_fin = run_record(rec)
             if rec["kind"] == "OFF":
                 run_file_row(rec, t_fin)
                 respawn_viewer(expno)

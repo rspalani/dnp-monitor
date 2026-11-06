@@ -183,6 +183,33 @@ Build-up runs
     of the records still to come (from settings.txt), and the run counts as
     quiet only when the next record is overdue.
 
+Decay runs
+    A run file with '# type = decay' (written by decay.py through fs_core.py) has a
+    reference record with the microwaves on, acquired at the end of the polarization,
+    and the decay records after the microwaves went off, each with its time t after
+    'stop' (ninth column; the target time in the tenth). The window and plot.png then
+    show the intensity per scan (or FID(t0) per NS*RG) against t, the reference as a
+    diamond at t = 0 (at the left edge with 'log t'), each set with a fitted curve,
+    chosen with 'Fit':
+      mono-exponential        S_eq + (S_0 - S_eq)*exp(-t/T1)   (default)
+      stretched exponential   S_eq + (S_0 - S_eq)*exp(-(t/T1)^beta), beta 0.1 to 3
+      bi-exponential          S_eq + S_1*exp(-t/T_1) + S_2*exp(-t/T_2)
+    Each record's pulse leaves cos(flip angle) of the polarization, so the k-th record
+    sees cos^k times the deviation from S_eq it would have without the earlier
+    pulses; the fit includes this (for the mono-exponential exactly, with the thermal
+    polarization that the pulses also take), with the flip angle from the run file
+    or the 'flip angle' field in the row below the top bar. The plot shows the fitted
+    curve as sampled (solid) and the decay without the pulses' losses (dotted), which
+    is the one T1 describes. 'S_eq' in the same row fixes the equilibrium level (in
+    the units of the plot, intensity per scan or FID(t0) per NS*RG), for a decay that
+    was not followed long enough to fit it; empty, it is fitted. The fits, standard
+    errors, error bars, 'normalized' (dividing by the fitted S_0), and the exports
+    work as for a build-up; the ratio S_0/S_eq is the enhancement retained at t = 0
+    over the equilibrium level. values.tsv has t and the fitted value of each record,
+    records.csv d1_s, t_s, and target_s columns, and 'Export: Decay EPS' writes
+    decay.eps. The 'Timing' row reports how well the records met their target
+    times.
+
 Error bars ('Error bars' in the main window; error_bars in phase.txt)
     noise floor  +/-1 sigma of each record from the noise of its own spectrum: the
                  points outside the intensity window (the whole spectrum if there is
@@ -200,12 +227,13 @@ Error bars ('Error bars' in the main window; error_bars in phase.txt)
                  I_on/I_off - 1 combined with the sigma of the start OFF of the set.
     repeats      the mean of the records at the same frequency (profile) or D1
                  (build-up, ON and OFF separately) over the sets (and a D1 repeated in
-                 D1_LIST), +/- its standard error, std/sqrt(n); one series instead of one
-                 per set. A point from one record has no bar.
-    For build-ups, 'weight the fits by 1/sigma^2' (fit_sigma) fits with these sigmas
+                 D1_LIST), or of the k-th record of each set (decay), +/- its standard
+                 error, std/sqrt(n); one series instead of one per set. A point from one
+                 record has no bar.
+    For build-ups and decays, 'weight the fits by 1/sigma^2' (fit_sigma) fits with these sigmas
     instead of NS and takes the standard errors from them; chi2/dof then compares the
     scatter with the error bars (about 1 if the noise explains it). With repeats, this
-    needs at least 3 records at every D1; otherwise the fit stays weighted by NS. With
+    needs at least 3 records at every D1 (every time); otherwise the fit stays weighted by NS. With
     error bars on, values.tsv and records.csv get the sigma (or mean, standard error,
     and number of records) of each record; with them off, the files are as before.
 
@@ -274,6 +302,8 @@ def read_run(path):
                     "finished": parts[5] if len(parts) > 5 else "",
                     "set": 1,
                     "d1": None,
+                    "t": None,
+                    "target": None,
                 }
             except ValueError:
                 continue
@@ -287,6 +317,14 @@ def read_run(path):
                     row["d1"] = float(parts[7])
                 except ValueError:
                     pass
+            if len(parts) > 9:                  # decay runs: time after the microwaves went off, target
+                try:
+                    row["t"] = float(parts[8])
+                    row["target"] = float(parts[9])
+                except ValueError:
+                    pass
+                if row["t"] is not None and row["t"] != row["t"]:      # nan
+                    row["t"] = None
             rows.append(row)
     return meta, rows, ended
 
@@ -713,7 +751,8 @@ def default_phase():
             "win_set": False, "center": None, "width": 20.0, "mode": "extreme",
             "show_integral": False, "fid_n": 4, "fid_fit": False, "show_fid_phase": False,
             "fit_model": "mono", "log_d1": False, "normalize": False,
-            "error_bars": "none", "noise_from": None, "noise_to": None, "fit_sigma": False}
+            "error_bars": "none", "noise_from": None, "noise_to": None, "fit_sigma": False,
+            "s_eq": None, "flip_deg": None}
 
 
 def phase_active(ph):
@@ -725,7 +764,7 @@ def phase_key(ph):
     return proc_key(ph) + (bool(ph.get("show_integral")), bool(ph.get("show_fid_phase")),
                            ph.get("fit_model", "mono"), bool(ph.get("log_d1")), bool(ph.get("normalize")),
                            ph.get("error_bars", "none"), ph.get("noise_from"), ph.get("noise_to"),
-                           bool(ph.get("fit_sigma")))
+                           bool(ph.get("fit_sigma")), ph.get("s_eq"), ph.get("flip_deg"))
 
 
 def proc_key(ph):
@@ -878,8 +917,9 @@ def phase_file_path(runpath):
 
 
 def eps_path(runpath, buildup=False):
-    """profile.eps (buildup.eps) next to run.txt, or <run file without .txt>_profile.eps."""
-    name = "buildup.eps" if buildup else "profile.eps"
+    """profile.eps (buildup.eps; decay.eps with buildup='decay') next to run.txt, or <run file
+    without .txt>_profile.eps."""
+    name = "decay.eps" if buildup == "decay" else "buildup.eps" if buildup else "profile.eps"
     if is_run_folder_layout(runpath):
         return os.path.join(os.path.dirname(runpath), name)
     return (runpath[:-4] if runpath.endswith(".txt") else runpath) + "_" + name
@@ -950,6 +990,8 @@ def read_phase_file(path):
     ph["noise_from"] = num("noise_from", None)
     ph["noise_to"] = num("noise_to", None)
     ph["fit_sigma"] = bool(int(num("fit_sigma", 0)))
+    ph["s_eq"] = num("s_eq", None)
+    ph["flip_deg"] = num("flip_deg", None)
     if "window_width" in vals:
         ph["win_set"] = True
         ph["center"] = num("window_center", None)
@@ -979,13 +1021,16 @@ def write_phase_file(path, ph, runpath):
         "# logarithmic D1 axis, normalize = 1 to divide each series by its fitted S_inf.\n"
         "# error_bars: none, noise (noise floor; noise_from/noise_to in ppm, none =\n"
         "# outside the window) or repeats; fit_sigma = 1 weights build-up fits by 1/sigma^2.\n"
+        "# Decay runs: s_eq fixes the equilibrium level (none = fitted); flip_deg overrides the\n"
+        "# flip angle in the run file.\n"
         "# fs_rephase.py (TopSpin)\n"
         "# applies the phase to the TopSpin data; everything else stays in the viewer.\n"
         "ph0 = %s\nph1 = %s\npivot_ppm = %s\nbase_phc0 = %s\nbase_phc1 = %s\n"
         "baseline = %d\nbaseline_order = %d\nmagnitude = %d\nshow_integral = %d\n"
         "fid_points = %d\nfid_fit = %d\nshow_fid_phase = %d\n"
         "fit_model = %s\nlog_d1 = %d\nnormalize = %d\n"
-        "error_bars = %s\nnoise_from = %s\nnoise_to = %s\nfit_sigma = %d\n%s"
+        "error_bars = %s\nnoise_from = %s\nnoise_to = %s\nfit_sigma = %d\n"
+        "s_eq = %s\nflip_deg = %s\n%s"
         % (run_label(runpath), time.strftime("%Y-%m-%d %H:%M:%S"),
            v(ph["ph0"]), v(ph["ph1"]), v(ph["pivot"]), v(ph["base0"]), v(ph["base1"]),
            1 if ph["baseline"] else 0, int(ph["order"]), 1 if ph["magnitude"] else 0,
@@ -993,7 +1038,7 @@ def write_phase_file(path, ph, runpath):
            1 if ph.get("fid_fit") else 0, 1 if ph.get("show_fid_phase") else 0,
            ph.get("fit_model", "mono"), 1 if ph.get("log_d1") else 0, 1 if ph.get("normalize") else 0,
            ph.get("error_bars", "none"), v(ph.get("noise_from")), v(ph.get("noise_to")),
-           1 if ph.get("fit_sigma") else 0, window))
+           1 if ph.get("fit_sigma") else 0, v(ph.get("s_eq")), v(ph.get("flip_deg")), window))
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         fh.write(text)
@@ -1384,6 +1429,645 @@ def buildup_fits(view, model, fit_sigma=False):
     return fits
 
 
+# --------------------------------------------------------------------------
+# Decay runs: fits with the small-flip-angle pulses taken into account
+# --------------------------------------------------------------------------
+DECAY_MODELS = OrderedDict([
+    ("mono", "mono-exponential"),
+    ("stretched", "stretched exponential"),
+    ("biexp", "bi-exponential"),
+])
+DECAY_FORMULAS = {
+    "mono": "S_eq + (S_0 - S_eq)*exp(-t/T1)",
+    "stretched": "S_eq + (S_0 - S_eq)*exp(-(t/T1)^beta)",
+    "biexp": "S_eq + S_1*exp(-t/T_1) + S_2*exp(-t/T_2), S_0 = S_eq + S_1 + S_2",
+}
+DECAY_FORMULAS_UI = {
+    "mono": "S_eq + (S₀ − S_eq)·exp(−t/T₁)",
+    "stretched": "S_eq + (S₀ − S_eq)·exp(−(t/T₁)^β)",
+    "biexp": "S_eq + S₁·exp(−t/T₁) + S₂·exp(−t/T₂)",
+}
+DECAY_SHORT = {"mono": "mono-exp.", "stretched": "stretched", "biexp": "bi-exp."}
+DECAY_NPAR = {"mono": 3, "stretched": 4, "biexp": 5}       # with S_eq free
+
+
+def decay_model(name):
+    """The decay model for the fit_model setting (the build-up's 'offset' has no decay form)."""
+    return name if name in DECAY_MODELS else "mono"
+
+
+def decay_columns(model, q, t, pulses, ct):
+    """Columns of the linear amplitudes of a decay sampled by pulses (each leaves cos(theta)
+    = ct of the polarization), at the times t of the records, for the nonlinear parameters q
+    (times; beta). Returns (columns for S_0 or S_1, S_2, column for S_eq). Mono-exponential:
+    exact, including the pulses' effect on the thermal part; the others: the deviation from
+    S_eq is multiplied by ct^k, k = pulses before t."""
+    t = np.asarray(t, dtype=float)
+    pulses = np.asarray(pulses, dtype=float)
+    k = np.array([np.count_nonzero(pulses < x - 1e-9) for x in t], dtype=float)
+    ck = ct ** k
+    if model == "mono":
+        T = q[0]
+        f = ck * np.exp(-t / T)
+        extra = np.zeros(t.size)
+        for i, x in enumerate(t):           # (1 - ct) * S_eq taken by each earlier pulse
+            tp = pulses[pulses < x - 1e-9]
+            if tp.size:
+                j = np.arange(tp.size)
+                extra[i] = (1.0 - ct) * np.sum(ct ** (tp.size - 1 - j) * np.exp(-(x - tp) / T))
+        return [f], 1.0 - f - extra
+    if model == "stretched":
+        f = ck * np.exp(-(t / q[0]) ** q[1])
+        return [f], 1.0 - f
+    return [ck * np.exp(-t / q[0]), ck * np.exp(-t / q[1])], np.ones(t.size)
+
+
+def decay_value(model, p, t, pulses, ct, s_eq=None):
+    """The fitted decay at times t; p as returned by fit_decay (S_eq included or fixed)."""
+    if model == "mono":
+        (a,), b = decay_columns(model, [p[2]], t, pulses, ct)
+        return p[0] * a + p[1] * b
+    if model == "stretched":
+        (a,), b = decay_columns(model, [p[2], p[3]], t, pulses, ct)
+        return p[0] * a + p[1] * b
+    (a1, a2), b = decay_columns(model, [p[3], p[4]], t, pulses, ct)
+    return p[0] * a1 + p[1] * a2 + p[2] * b
+
+
+def fit_decay(t, y, w, model, pulses, flip_deg, s_eq=None, absolute=False):
+    """Weighted least squares fit of a decay y(t) sampled by pulses of flip_deg at the times
+    pulses (all records of the series, with or without a value). s_eq: fixed equilibrium
+    level, or None to fit it. w, absolute: as for fit_buildup. Parameters p: mono [S_0,
+    S_eq, T1], stretched [S_0, S_eq, T1, beta], biexp [S_1, S_2, S_eq, T_1, T_2]."""
+    t, y, w = (np.asarray(v, dtype=float) for v in (t, y, w))
+    ct = math.cos(math.radians(flip_deg))
+    k = DECAY_NPAR[model] - (1 if s_eq is not None else 0)
+    if t.size < k:
+        raise ValueError("%d point%s; the %s fit needs at least %d"
+                         % (t.size, "" if t.size == 1 else "s", DECAY_MODELS[model], k))
+    sw = np.sqrt(w) if absolute else np.sqrt(w / np.mean(w))
+    tpos = t[t > 0]
+    tmin = float(tpos.min()) if tpos.size else 1.0
+    tmax = float(t.max())
+    lo, hi = math.log(tmin / 30.0), math.log(tmax * 30.0)
+    big = 1e300
+
+    def q_of(u):
+        if model == "stretched":
+            return [math.exp(u[0]), math.exp(u[1])]
+        return sorted(math.exp(x) for x in u)
+
+    def amps(q):
+        cols, beq = decay_columns(model, q, t, pulses, ct)
+        if s_eq is None:
+            return _amplitudes(cols + [beq], y, sw)
+        return _amplitudes(cols, y - s_eq * beq, sw)
+
+    def cost(u):
+        if model == "stretched":
+            if not (lo - 1 < u[0] < hi + 1 and math.log(0.1) <= u[1] <= math.log(3.0)):
+                return big
+        elif any(not (lo - 1 < x < hi + 1) for x in u):
+            return big
+        return amps(q_of(u))[1]
+
+    grid = np.linspace(lo, hi, 121)
+    if model == "biexp":
+        g = grid[::4]
+        starts = [min(([a, b] for i, a in enumerate(g) for b in g[i + 1:]), key=cost)]
+    elif model == "stretched":
+        u0 = min(grid, key=lambda x: cost([x, 0.0]))
+        starts = [[u0, 0.0], [u0, math.log(0.5)], [u0, math.log(1.5)]]
+    else:
+        starts = [[min(grid, key=lambda x: cost([x]))]]
+    best = None
+    for s0 in starts:
+        u, c = _nelder_mead(cost, s0, [0.3] * len(s0))
+        if best is None or c < best[1]:
+            best = (u, c)
+    u, chi2 = best
+    q = q_of(u)
+    a = amps(q)[0]
+    seq = float(a[-1]) if s_eq is None else float(s_eq)
+    if model == "mono":
+        p = np.array([a[0], seq, q[0]])
+    elif model == "stretched":
+        p = np.array([a[0], seq, q[0], q[1]])
+    else:
+        p = np.array([a[0], a[1], seq, q[0], q[1]])
+    free = [j for j in range(p.size) if not (s_eq is not None and j == (2 if model == "biexp" else 1))]
+
+    n = t.size
+    cov = None
+    if n > k or absolute:
+        J = np.empty((n, len(free)))
+        for col, j in enumerate(free):
+            h = 1e-6 * max(abs(p[j]), 1e-12)
+            pp, pm = p.copy(), p.copy()
+            pp[j] += h
+            pm[j] -= h
+            J[:, col] = (decay_value(model, pp, t, pulses, ct) - decay_value(model, pm, t, pulses, ct)) / (2 * h)
+        Jw = J * sw[:, None]
+        try:
+            cov = np.linalg.inv(Jw.T.dot(Jw)) * (1.0 if absolute else chi2 / (n - k))
+        except np.linalg.LinAlgError:
+            cov = None
+
+    def err(grad_full):
+        if cov is None:
+            return None
+        g = np.array([grad_full[j] for j in free])
+        v = float(np.dot(g, cov.dot(g)))
+        return math.sqrt(v) if v >= 0 and np.isfinite(v) else None
+
+    def unit(j):
+        e = np.zeros(p.size)
+        e[j] = 1.0
+        return e
+    par = OrderedDict()
+    notes = []
+    fixed = s_eq is not None
+    if model == "biexp":
+        par["T_1"] = (p[3], err(unit(3)))
+        par["T_2"] = (p[4], err(unit(4)))
+        par["S_0"] = (p[0] + p[1] + p[2], err(np.array([1.0, 1.0, 0.0 if fixed else 1.0, 0, 0])))
+        par["S_eq"] = (p[2], None if fixed else err(unit(2)))
+        s1 = p[0] + p[1]
+        if s1:
+            par["f_1"] = (p[0] / s1, err(np.array([p[1] / s1 ** 2, -p[0] / s1 ** 2, 0, 0, 0])))
+        times = [p[3], p[4]]
+        s0, sq = par["S_0"][0], p[2]
+    else:
+        par["T1"] = (p[2], err(unit(2)))
+        par["S_0"] = (p[0], err(unit(0)))
+        par["S_eq"] = (p[1], None if fixed else err(unit(1)))
+        if model == "stretched":
+            par["beta"] = (p[3], err(unit(3)))
+            if p[3] <= 0.101 or p[3] >= 2.99:
+                notes.append("beta at the limit of the search (0.1 to 3)")
+        times = [p[2]]
+        s0, sq = p[0], p[1]
+    why = None
+    if max(times) >= tmax * 29.0:
+        why = "T1 beyond 30 times the last time (hardly any decay yet)"
+    elif min(times) <= tmin / 29.0:
+        why = "T1 below 1/30 of the first time (decayed before the first record)"
+    if why is None and not fixed and tmax < 3.0 * max(times):
+        notes.append("last time = %.2g T1: S_eq poorly determined (fix it in the viewer if known)"
+                     % (tmax / max(times)))
+    ratio = s0 / sq if (sq and abs(sq) > 1e-12 * abs(s0)) else None
+    return {"model": model, "p": p, "params": par, "n": n, "chi2_red": chi2 / (n - k) if n > k else None,
+            "times": times, "notes": notes, "determined": why is None, "why": why, "absolute": bool(absolute),
+            "s_inf": s0, "s0": s0, "s_eq": sq, "s_eq_fixed": fixed, "ratio": ratio, "flip_deg": flip_deg,
+            "pulses": list(pulses), "tmin": tmin, "tmax": tmax}
+
+
+def decay_summary(f, ascii_only=False):
+    """One line: T1 (or T_1, T_2), S_0, S_eq, the other parameters, S_0/S_eq."""
+    if not ascii_only and not f["determined"]:
+        return ui_text("not determined: " + f["why"])
+    names = {"T1": "T1" if ascii_only else "T₁", "T_1": "T_1" if ascii_only else "T₁",
+             "T_2": "T_2" if ascii_only else "T₂", "S_0": "S_0" if ascii_only else "S₀",
+             "S_eq": "S_eq", "beta": "beta" if ascii_only else "β", "f_1": "f_1" if ascii_only else "f₁"}
+    pm = (lambda v, e: fmt_pm(v, e).replace("±", "+/-")) if ascii_only else fmt_pm
+    tm = (lambda v, e: fmt_time(v, e).replace("±", "+/-")) if ascii_only else fmt_time
+    parts = []
+    for key, (v, e) in f["params"].items():
+        txt = tm(v, e) if key.startswith("T") else pm(v, e)
+        if key == "S_eq" and f["s_eq_fixed"]:
+            txt = "%.6g (fixed)" % v
+        parts.append("%s %s" % (names[key], txt))
+    if f["ratio"] is not None:
+        parts.append("S_0/S_eq %.4g" % f["ratio"] if ascii_only else "S₀/S_eq %.4g" % f["ratio"])
+    if f.get("absolute") and f["chi2_red"] is not None:
+        parts.append("%s %.3g" % ("chi2/dof" if ascii_only else "χ²/dof", f["chi2_red"]))
+    return ("; " if ascii_only else " · ").join(parts)
+
+
+def decay_t(r):
+    """Time of a decay record after the microwaves went off; the reference counts as t = 0."""
+    return 0.0 if r["kind"] == "ON" else r["t"]
+
+
+def decay_records(results):
+    """{set: the records of the set with a time, in acquisition order (reference first)}."""
+    out = OrderedDict()
+    for s in sorted(set(r["set"] for r in results if r.get("t") is not None)):
+        out[s] = sorted([r for r in results if r["set"] == s and r.get("t") is not None],
+                        key=lambda r: (r["kind"] != "ON", r["t"]))
+    return out
+
+
+def decay_view(results, errm):
+    """The points of each decay series: {("D", set): {"x" (t, reference 0), "y", "e", "ns",
+    "n", "recs", "ref" (reference point?), "pulses" (times of every record of the set, with or
+    without a value)}}. With errm 'repeats', one series (set 0): the mean over the sets of the
+    k-th record of each, with its standard error."""
+    per = decay_records(results)
+    out = OrderedDict()
+    if errm == "repeats" and per:
+        n = max(len(v) for v in per.values())
+        v = {"x": [], "y": [], "e": [], "ns": [], "n": [], "recs": [], "ref": [], "pulses": []}
+        for i in range(n):
+            g = [recs[i] for recs in per.values() if i < len(recs)]
+            v["pulses"].append(float(np.mean([decay_t(r) for r in g])))
+            gy = [r for r in g if r["y"] is not None]
+            if not gy:
+                continue
+            ys = np.array([r["y"] for r in gy], dtype=float)
+            v["x"].append(float(np.mean([decay_t(r) for r in gy])))
+            v["y"].append(float(np.mean(ys)))
+            v["e"].append(float(np.std(ys, ddof=1) / math.sqrt(ys.size)) if ys.size > 1 else None)
+            v["ns"].append(sum((r["ns"] or r["ns_run"]) for r in gy))
+            v["n"].append(ys.size)
+            v["recs"].append(gy)
+            v["ref"].append(gy[0]["kind"] == "ON")
+        if v["x"]:
+            out[("D", 0)] = v
+        return out
+    for s, recs in per.items():
+        pts = [r for r in recs if r["y"] is not None]
+        if pts:
+            out[("D", s)] = {"x": [decay_t(r) for r in pts], "y": [r["y"] for r in pts],
+                             "e": [r.get("ey") for r in pts],
+                             "ns": [r["ns"] if r["ns"] else r["ns_run"] for r in pts],
+                             "n": [1] * len(pts), "recs": [[r] for r in pts],
+                             "ref": [r["kind"] == "ON" for r in pts],
+                             "pulses": [decay_t(r) for r in recs]}
+    return out
+
+
+def decay_fits(view, model, fit_sigma, s_eq, flip_deg):
+    """{key: fit_decay result, or {"error": text}} for each series of the view; weights as
+    for buildup_fits."""
+    fits = OrderedDict()
+    for key, v in view.items():
+        e = v["e"]
+        use_sigma = fit_sigma and all(x is not None and x > 0 for x in e)
+        rough = key[1] == 0 and min(v["n"]) < 3
+        try:
+            if use_sigma and not rough:
+                f = fit_decay(v["x"], v["y"], [1.0 / x ** 2 for x in e], model, v["pulses"], flip_deg,
+                              s_eq, absolute=True)
+                if f["chi2_red"] is not None and f["chi2_red"] > 3:
+                    f["notes"].append("scatter about %.2g times the error bars (chi2/dof %.3g)"
+                                      % (math.sqrt(f["chi2_red"]), f["chi2_red"]))
+            else:
+                f = fit_decay(v["x"], v["y"], v["ns"], model, v["pulses"], flip_deg, s_eq)
+                if fit_sigma:
+                    f["notes"].append("weighted by NS: %s" % (
+                        "fewer than 3 records at some time, too few for weights from their spread" if rough
+                        else "not every point has an error bar"))
+            fits[key] = f
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError, OverflowError) as ex:
+            fits[key] = {"error": str(ex)}
+    return fits
+
+
+def decay_series_name(key, multi):
+    if key[1] == 0:
+        return "mean"
+    return ("set %d" % key[1]) if multi else "decay"
+
+
+T_LABEL = "time after the microwaves went off (s)"
+
+
+def plot_decay(ax1, a, ascii_only=False, ms=5):
+    """The decay series of a with their error bars and fitted curves on ax1: the curve as
+    sampled (with the pulses' losses) and, thinner, the decay without them. The reference
+    is a diamond at t = 0 (on a log axis at the left edge). Returns (artists, view, scales)."""
+    view = decay_view(a["results"], a["error_bars"])
+    fits, norm, multi = a["fits"], a["normalize"], a["multi_set"]
+    ct = math.cos(math.radians(a["flip_deg"]))
+    xs = [x for v in view.values() for x in v["x"] if x > 0]
+    logx = a["log_d1"] and bool(xs)
+    x0 = (min(xs) / 3.0) if logx else 0.0          # where the reference is drawn
+    tt = None
+    if xs:
+        if logx:
+            tt = np.exp(np.linspace(math.log(min(xs) / 2.0), math.log(max(xs) * 1.5), 400))
+        else:
+            tt = np.linspace(0.0, max(xs) * 1.05, 400)
+    arts, scales = [], {}
+    ref_done = False                               # one legend entry for the references
+    for i, (key, v) in enumerate(view.items()):
+        col = SET_COLORS[i % len(SET_COLORS)]
+        f = fits.get(key)
+        ok = f is not None and "error" not in f
+        scale = 1.0
+        if norm:
+            if not ok or not f["determined"] or not f["s0"]:
+                continue
+            scale = 1.0 / f["s0"]
+        scales[key] = scale
+        name = decay_series_name(key, multi)
+        px = [x0 if r else x for x, r in zip(v["x"], v["ref"])]
+        withe = [(x, y, e) for x, y, e in zip(px, v["y"], v["e"]) if e is not None]
+        if withe:
+            c = ax1.errorbar([q[0] for q in withe], [q[1] * scale for q in withe],
+                             yerr=[q[2] * scale for q in withe], fmt="none", ecolor=col,
+                             elinewidth=0.9, capsize=2.5, zorder=2.5)
+            arts += [x for x in [c.lines[0]] + list(c.lines[1]) + list(c.lines[2]) if x is not None]
+        dx = [x for x, r in zip(px, v["ref"]) if not r]
+        dy = [y * scale for y, r in zip(v["y"], v["ref"]) if not r]
+        arts += ax1.plot(dx, dy, ls="none", marker="o", color=col, ms=ms, label=name, zorder=3)
+        rx = [x for x, r in zip(px, v["ref"]) if r]
+        if rx:
+            ry = [y * scale for y, r in zip(v["y"], v["ref"]) if r]
+            arts += ax1.plot(rx, ry, ls="none", marker="D", color=col, mfc="none", ms=ms + 1, mew=1.4,
+                             label=None if ref_done else "%s (t = 0%s)" % (
+                                 "references" if multi else "reference", ", drawn at the left" if logx else ""),
+                             zorder=3)
+            ref_done = True
+        if ok and tt is not None:
+            p, pulses = f["p"], v["pulses"]
+            lab = ("%s fit" % name) if multi or a["error_bars"] == "repeats" else "fit"
+            if f["determined"]:
+                P = f["params"]
+                if f["model"] == "biexp":
+                    lab += (", T1 %.3g s, T2 %.3g s" if ascii_only else ", T₁ %.3g s, T₂ %.3g s") \
+                        % (P["T_1"][0], P["T_2"][0])
+                else:
+                    lab += (", T1 %.3g s" if ascii_only else ", T₁ %.3g s") % P["T1"][0]
+                    if f["model"] == "stretched":
+                        lab += (", beta %.2f" if ascii_only else ", β %.2f") % P["beta"][0]
+            else:
+                lab += ": not determined"
+            arts += ax1.plot(tt, decay_value(f["model"], p, tt, pulses, ct) * scale,
+                             "-" if f["determined"] else "--", color=col, lw=1.1, label=lab, zorder=2)
+            if f["determined"]:
+                arts += ax1.plot(tt, decay_value(f["model"], p, tt, [], 1.0) * scale, ":", color=col,
+                                 lw=1.0, label="without the pulses' losses" if i == 0 else None, zorder=1.5)
+    return arts, view, scales
+
+
+def decay_xlim(ax1, a, view):
+    xs = [x for v in view.values() for x in v["x"] if x > 0]
+    if a["log_d1"] and xs:
+        ax1.set_xscale("log")
+        ax1.set_xlim(min(xs) / 4.0, max(xs) * 1.6)
+        ax1.xaxis.set_major_formatter(FuncFormatter(lambda v, pos: "%g" % v))
+    elif xs:
+        ax1.set_xlim(-0.02 * max(xs), max(xs) * 1.07)
+
+
+def decay_ylabel(a, ascii_only=False):
+    if a["normalize"]:
+        return "S / S_0 (fitted)" if ascii_only else "S / S₀ (fitted)"
+    return "FID(t0) / (NS*RG)" if a["fid_mode"] else "intensity per scan"
+
+
+def draw_decay(p, a, runpath):
+    """The decay against the time after the microwaves went off (ax1), the FID phase below it
+    if shown (ax3), and for plot.png the latest spectrum (ax2)."""
+    p.layout(a["show_fid_phase"])
+    ax1, ax2, ax1b, ax3 = p.ax1, p.ax2, p.ax1b, p.ax3
+    fig = p.fig
+    if ax1.get_xscale() != "linear":
+        ax1.set_xscale("linear")
+    ax1.clear()
+    if ax2 is not None:
+        ax2.clear()
+    ax1b.clear()
+    ax1b.set_visible(False)
+    if ax3 is not None:
+        ax3.clear()
+    res, multi = a["results"], a["multi_set"]
+    arts, view, scales = plot_decay(ax1, a)
+    pts = [(key, i) for key, v in view.items() if key in scales for i in range(len(v["x"]))]
+    if pts:
+        allr = [r for key, v in view.items() if key in scales for rs in v["recs"] for r in rs]
+        last = max(allr, key=lambda q: q["expno"])
+        for key, v in view.items():
+            if key not in scales:
+                continue
+            for i, rs in enumerate(v["recs"]):
+                if last in rs:
+                    xs = [x for x in v["x"] if x > 0]
+                    x = v["x"][i] if not v["ref"][i] else ((min(xs) / 3.0) if (a["log_d1"] and xs) else 0.0)
+                    ax1.plot([x], [v["y"][i] * scales[key]], "o", color="#c0392b", ms=8, mfc="none", mew=1.8,
+                             zorder=4)
+        ax1.legend(fontsize=8, loc="best")
+    else:
+        ax1.text(0.5, 0.5, "waiting for the first record" if not view else
+                 "no fit to normalize to (see the lines above)", transform=ax1.transAxes,
+                 ha="center", va="center", color="0.4")
+    ax1.set_ylabel(decay_ylabel(a))
+    ax1.axhline(0.0, color="0.6", lw=0.8)
+    decay_xlim(ax1, a, view)
+    if ax3 is not None:
+        on = [r for r in res if r.get("t") is not None and r["fid"] and r["fid"]["phase_rel"] is not None]
+        for i, (s, recs) in enumerate(decay_records(res).items()):
+            q = [r for r in on if r["set"] == s]
+            if q:
+                ax3.plot([max(decay_t(r), 1e-9) for r in q], [r["fid"]["phase_rel"] for r in q], ls="none",
+                         marker="o", color=SET_COLORS[i % len(SET_COLORS)], ms=4)
+        if not on:
+            ax3.text(0.5, 0.5, "no FID phase (see the lines above the plot)", transform=ax3.transAxes,
+                     ha="center", va="center", color="0.4")
+        ax3.axhline(0.0, color="0.6", lw=0.8)
+        if p.compact:
+            ax3.set_title("FID phase (deg), relative to the reference record", loc="left", fontsize=8)
+        else:
+            ax3.set_ylabel("FID phase (deg)", fontsize=9)
+        ax3.set_xlabel(T_LABEL)
+        ax3.grid(True, color="0.9")
+        ax1.tick_params(labelbottom=False)
+        fig.align_ylabels([ax1, ax3])
+    else:
+        ax1.set_xlabel(T_LABEL)
+    ax1.grid(True, color="0.9")
+    if p.compact:
+        p.fit_layout()
+        return
+    model = a["fit_model"]
+    lines = ["fit: %s, %s (%s; each record corrected for the %g deg pulses before it; +/- one standard error)"
+             % (DECAY_MODELS[model], DECAY_FORMULAS[model], fit_weight_text(a, True), a["flip_deg"])]
+    if a["error_bars"] != "none":
+        lines.append(error_text(a, ascii_only=True))
+    for key, f in a["fits"].items():
+        name = decay_series_name(key, multi)
+        if "error" in f:
+            lines.append("%s: no fit: %s" % (name, f["error"]))
+            continue
+        lines.append("%s: %s" % (name, decay_summary(f, ascii_only=True)))
+        lines += ["%s: NOTE: %s" % (name, n) for n in
+                  f["notes"] + ([] if f["determined"] else ["not determined: " + f["why"]])]
+    lines.extend(phase_status(a))
+    lines += decay_timing(a, ascii_only=True)
+    bad = [r for r in res if r["value"] is None
+           and not (a["fid_mode"] and r["fid"]["read"] and r["fid"]["g"] is None)]
+    for r in bad[-3:]:
+        lines.append("expno %d: %s" % (r["expno"], r["note"]))
+    ax1.set_title("\n".join(lines), loc="left", fontsize=8, color="0.25", family="monospace")
+    draw_latest(ax2, a)
+    meta = a["meta"]
+    status = "running" if a["ended"] is None else a["ended"]
+    what = mode_label(a["mode"], a) if a["fid_mode"] else "%s, %s" % (window_text(a), a["mode"])
+    fig.suptitle("%s  |  %s  |  %s\n%s  |  decay, %s  |  %d records  |  %s"
+                 % (meta.get("sample", ""), meta.get("conditions", ""),
+                    os.path.basename(meta.get("dataset_dir", "")) or os.path.dirname(runpath),
+                    run_label(runpath), what, len(res), status), fontsize=9)
+    relayout(fig, 0.05 if p.with_text else 0.0, 0.92)
+
+
+def decay_timing(a, ascii_only=False):
+    """One line on how well the records met their target times ([] if there is nothing yet)."""
+    recs = [r for r in a["results"] if r.get("t") is not None and r["kind"] == "OFF"
+            and r.get("target") is not None]
+    if not recs:
+        return []
+    dev = [r["t"] - r["target"] for r in recs]
+    late = [r for r in recs if r["t"] - r["target"] > 2.0]
+    txt = "record times: within %.1f s of their targets" % max(abs(d) for d in dev)
+    if late:
+        txt = ("record times: %d of %d later than their targets by more than 2 s (targets too close "
+               "together; the actual times are used)" % (len(late), len(recs)))
+    return [txt]
+
+
+def decay_info(a, runpath):
+    """Rows (key, text, warn) for a decay run, for the window."""
+    rows = profile_info(a, runpath)[:1]
+    model = a["fit_model"]
+    if a["fid_mode"]:
+        meas = [mode_label(a["mode"], a), grpdly_text(a["results"]), "per NS·RG"]
+    else:
+        proc = spectrum_status(a)
+        meas = [window_text(a).replace("+/-", "±"), a["mode"],
+                "; ".join(proc) if proc else "spectra as processed by TopSpin"]
+    meas.append("fit: %s %s, %s, S_eq %s, corrected for the earlier %g° pulses; ± 1 standard error"
+                % (DECAY_MODELS[model], DECAY_FORMULAS_UI[model], fit_weight_text(a),
+                   "fixed at %g" % a["s_eq_fixed"] if a["s_eq_fixed"] is not None else "fitted",
+                   a["flip_deg"]))
+    if a["error_bars"] != "none":
+        meas.append(error_text(a))
+    rows.append(("Measure", " · ".join(meas), False))
+    notes = []
+    for key, f in a["fits"].items():
+        name = decay_series_name(key, a["multi_set"]).capitalize()
+        if "error" in f:
+            rows.append((name, "no fit: %s" % f["error"], True))
+            continue
+        rows.append((name, decay_summary(f), not f["determined"]))
+        notes += ["%s %s" % (name, ui_text(n)) for n in f["notes"]]
+    if not a["fits"]:
+        rows.append(("", "waiting for the first record", False))
+    t = decay_timing(a)
+    if t:
+        rows.append(("Timing", t[0].replace("record times: ", ""), "later" in t[0]))
+    if notes:
+        rows.append(("Note", "; ".join(notes), True))
+    for line in fid_status(a):
+        if line.startswith("WARNING: "):
+            rows.append(("Warning", line[len("WARNING: "):], True))
+    bad = [r for r in a["results"] if r["value"] is None
+           and not (a["fid_mode"] and r["fid"]["read"] and r["fid"]["g"] is None)]
+    for r in bad[-3:]:
+        rows.append(("Warning", "expno %d: %s" % (r["expno"], r["note"]), True))
+    return rows
+
+
+def write_decay_tsv(path, a):
+    """values.tsv of a decay: one row per record with its time and the fitted value; the fits
+    in the header."""
+    if a["fid_mode"]:
+        what = "mode %s (intensity_per_scan = FID(t0) / (NS*RG))" % mode_label(a["mode"], a)
+    else:
+        what = "%s, mode %s" % (window_text(a), a["mode"])
+    fits, em = a["fits"], a["error_bars"]
+    ct = math.cos(math.radians(a["flip_deg"]))
+    view = decay_view(a["results"], em)
+    with open(path, "w") as fh:
+        fh.write("# decay; %s; t = time of the record's pulse after the microwaves went off "
+                 "(the reference: t_s as measured, fitted at 0)\n" % what)
+        st = phase_status(a)
+        fh.write("# %s\n" % ("; ".join(st) if st else "phase: as processed by TopSpin"))
+        fh.write("# fit: %s, %s; least squares %s; S_eq %s; each record corrected for the %g deg pulses "
+                 "before it; +/- one standard error\n"
+                 % (DECAY_MODELS[a["fit_model"]], DECAY_FORMULAS[a["fit_model"]], fit_weight_text(a, True),
+                    "fixed at %g" % a["s_eq_fixed"] if a["s_eq_fixed"] is not None else "fitted", a["flip_deg"]))
+        if em != "none":
+            fh.write("# %s\n" % error_text(a, ascii_only=True))
+        for key, f in fits.items():
+            name = decay_series_name(key, a["multi_set"])
+            if "error" in f:
+                fh.write("# %s: no fit: %s\n" % (name, f["error"]))
+            else:
+                notes = f["notes"] + ([] if f["determined"] else ["not determined: " + f["why"]])
+                fh.write("# %s: %s%s\n" % (name, decay_summary(f, ascii_only=True),
+                                          "".join("; NOTE: " + n for n in notes)))
+        for line in decay_timing(a, ascii_only=True):
+            fh.write("# %s\n" % line)
+        extra = {"none": "", "noise": "\tsigma_per_scan", "repeats": "\tmean_per_scan\tsem_per_scan\tn_repeats"}[em]
+        fh.write("expno\tkind\tlabel\tset\tt_s\ttarget_s\td1_s\tns\tintensity_per_scan\tppm_of_point\t"
+                 "fit_per_scan\tnote%s\n" % extra)
+        for r in a["results"]:
+            key = ("D", 0 if em == "repeats" else r["set"])
+            f, fv = fits.get(key), ""
+            if f is not None and "error" not in f and r.get("t") is not None and key in view:
+                fv = "%.6g" % decay_value(f["model"], f["p"], [decay_t(r)], view[key]["pulses"], ct)[0]
+            cols = ""
+            if em == "noise":
+                cols = "\t" + ("" if r["ey"] is None else "%.4g" % r["ey"])
+            elif em == "repeats":
+                vp = view_point(view, r)
+                if vp is None:
+                    cols = "\t\t\t"
+                else:
+                    v, i = view[vp[0]], vp[1]
+                    cols = "\t%.6g\t%s\t%d" % (v["y"][i], "" if v["e"][i] is None else "%.4g" % v["e"][i], v["n"][i])
+            fh.write("%d\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n" % (
+                r["expno"], r["kind"], r["label"], r["set"],
+                "" if r.get("t") is None else "%.3f" % r["t"],
+                "" if r.get("target") is None else "%g" % r["target"],
+                "" if r["d1"] is None else "%g" % r["d1"],
+                r["ns"] if r["ns"] is not None else r["ns_run"],
+                "" if r["value"] is None else "%.6g" % r["value"],
+                "" if r["at"] is None else "%.2f" % r["at"], fv, r["note"], cols))
+
+
+def write_decay_eps(path, a, aspect=None):
+    """The decay as shown, for Adobe Illustrator as write_profile_eps."""
+    from matplotlib.backends.backend_ps import FigureCanvasPS
+    if not decay_view(a["results"], a["error_bars"]):
+        raise ValueError("no record with a value yet")
+    pts = [r for r in a["results"] if r.get("t") is not None and r["fid"] and r["fid"]["phase_rel"] is not None]
+    with_ph = a["show_fid_phase"] and bool(pts)
+    with matplotlib.rc_context(EPS_RC):
+        h = min(5.0, max(2.0, EPS_WIDTH * aspect)) if aspect else (4.4 if with_ph else 3.2)
+        fig = Figure(figsize=(EPS_WIDTH, h))
+        FigureCanvasPS(fig)
+        if with_ph:
+            gs = fig.add_gridspec(2, 1, height_ratios=[2.6, 1])
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax3 = fig.add_subplot(gs[1, 0], sharex=ax1)
+        else:
+            ax1, ax3 = fig.add_subplot(111), None
+        lines, view, scales = plot_decay(ax1, a, ascii_only=True, ms=4)
+        ax1.set_ylabel(decay_ylabel(a, ascii_only=True))
+        lines.append(ax1.axhline(0.0, color="0.6", lw=0.6, zorder=0))
+        ax1.legend(fontsize=8, frameon=False, loc="best")
+        decay_xlim(ax1, a, view)
+        if ax3 is not None:
+            for i, (s, recs) in enumerate(decay_records(a["results"]).items()):
+                q = [r for r in pts if r["set"] == s]
+                if q:
+                    lines += ax3.plot([max(decay_t(r), 1e-9) for r in q], [r["fid"]["phase_rel"] for r in q],
+                                      ls="none", marker="o", color=SET_COLORS[i % len(SET_COLORS)], ms=3)
+            lines.append(ax3.axhline(0.0, color="0.6", lw=0.6, zorder=0))
+            ax3.set_ylabel("FID phase (deg)")
+            ax3.set_xlabel(T_LABEL)
+            ax1.tick_params(labelbottom=False)
+        else:
+            ax1.set_xlabel(T_LABEL)
+        for ln in lines:
+            ln.set_clip_on(False)
+        fig.tight_layout()
+        save_eps_for_illustrator(fig, path)
+
+
 def planned_records(runpath):
     """[(expno, expected s)] of a build-up from settings.txt in the run folder, or None."""
     if not is_run_folder_layout(runpath):
@@ -1617,6 +2301,7 @@ class Analyzer:
             center, width, mode = ph["center"], ph["width"], ph["mode"]
         skey = proc_key(ph)
         buildup = meta.get("type") == "buildup"
+        decay = meta.get("type") == "decay"
         errm = ph.get("error_bars", "none")
         region = None
         if ph.get("noise_from") is not None and ph.get("noise_to") is not None \
@@ -1709,13 +2394,17 @@ class Analyzer:
             for r in results:
                 r["y"] = r["value"] if r["d1"] is not None else None
                 r["yi"] = None
+        if decay:                                # one series per set, against the time
+            for r in results:
+                r["y"] = r["value"] if r.get("t") is not None else None
+                r["yi"] = None
         # sigma of y and yi from the noise floor (ratio to the start OFF of the set)
         for r in results:
             r["ey"] = r["eyi"] = None
             if errm != "noise":
                 continue
             if r["y"] is not None:
-                if buildup or not use_enh:
+                if buildup or decay or not use_enh:
                     r["ey"] = r["err"]
                 elif r["set"] in valid:
                     o = valid[r["set"]]
@@ -1730,6 +2419,15 @@ class Analyzer:
         if buildup:
             fits = buildup_fits(buildup_view(results, errm), ph.get("fit_model", "mono"),
                                 bool(ph.get("fit_sigma")) and errm != "none")
+        flip = ph.get("flip_deg")
+        if flip is None:
+            try:
+                flip = float(meta.get("flip_deg", "5"))
+            except ValueError:
+                flip = 5.0
+        if decay:
+            fits = decay_fits(decay_view(results, errm), decay_model(ph.get("fit_model", "mono")),
+                              bool(ph.get("fit_sigma")) and errm != "none", ph.get("s_eq"), flip)
 
         latest = None
         readable = [r for r in results if r["readable"]]
@@ -1750,11 +2448,13 @@ class Analyzer:
                 "fid_mode": fid_mode, "fid_n": int(ph["fid_n"]), "fid_fit": bool(ph["fid_fit"]),
                 "show_fid_phase": bool(ph.get("show_fid_phase")), "need_fid": need_fid,
                 "fid_ref": fid_ref, "latest_fid": latest_fid, "plan": run_plan(self.runpath),
-                "buildup": buildup, "fits": fits, "fit_model": ph.get("fit_model", "mono"),
+                "buildup": buildup, "fits": fits,
+                "fit_model": decay_model(ph.get("fit_model", "mono")) if decay else ph.get("fit_model", "mono"),
+                "decay": decay, "flip_deg": flip, "s_eq_fixed": ph.get("s_eq"),
                 "error_bars": errm, "noise_region": region,
                 "fit_sigma": bool(ph.get("fit_sigma")) and errm != "none",
                 "log_d1": bool(ph.get("log_d1")), "normalize": bool(ph.get("normalize")),
-                "planned": planned_records(self.runpath) if buildup else None}
+                "planned": planned_records(self.runpath) if (buildup or decay) else None}
 
     # -- CSV ----------------------------------------------------------------------
     def window_integrals(self, ds_dir, r, ph, center, width):
@@ -1829,10 +2529,15 @@ class Analyzer:
         cols = ["expno", "set", "kind", "label", "freq_GHz", "acq_time", "acq_epoch_s", "ns", "rg",
                 "grpdly", "fid_t0_mean_per_ns_rg", "fid_t0_fit_per_ns_rg", "fid_phase_deg",
                 "fid_phase_abs_deg", "real_integral_per_scan", "magnitude_integral_per_scan", "note"]
-        if a.get("buildup"):                     # D1 after the frequency
+        if a.get("buildup") or a.get("decay"):   # D1 after the frequency
             cols.insert(5, "d1_s")
             for row, r in zip(rows, a["results"]):
                 row.insert(5, "" if r["d1"] is None else "%g" % r["d1"])
+        if a.get("decay"):                       # then the time after the microwaves went off
+            cols[6:6] = ["t_s", "target_s"]
+            for row, r in zip(rows, a["results"]):
+                row[6:6] = ["" if r.get("t") is None else "%.3f" % r["t"],
+                            "" if r.get("target") is None else "%g" % r["target"]]
         if a.get("error_bars") == "noise":       # noise-floor sigmas at the end
             cols += ["noise_sigma_point_per_scan", "sigma_value", "sigma_integral"]
             head.append("noise_sigma_point_per_scan: noise of one spectrum point; sigma_value: of the "
@@ -2185,6 +2890,8 @@ def write_buildup_tsv(path, a):
 def write_tsv(path, a):
     if a.get("buildup"):
         return write_buildup_tsv(path, a)
+    if a.get("decay"):
+        return write_decay_tsv(path, a)
     if a["fid_mode"]:
         what = "mode %s (intensity_per_scan = FID(t0) / (NS*RG)); integral columns: %s" % (
             mode_label(a["mode"], a), window_text(a))
@@ -2288,7 +2995,9 @@ class Panels:
 def record_what(r, multi):
     """'ON 526.050 GHz' or 'OFF start' (build-ups: 'ON, D1 30 s'), with the set if there are
     several."""
-    if r.get("d1") is not None:
+    if r.get("t") is not None:
+        what = "reference (MW on)" if r["kind"] == "ON" else "t %.0f s" % r["t"]
+    elif r.get("d1") is not None:
         what = "%s, D1 %g s" % (r["kind"], r["d1"])
     else:
         what = ("ON %.3f GHz" % r["freq"]) if r["kind"] == "ON" else ("OFF %s" % r["label"])
@@ -2456,6 +3165,8 @@ def draw(p, a, runpath):
     intensities are plotted."""
     if a.get("buildup"):
         return draw_buildup(p, a, runpath)
+    if a.get("decay"):
+        return draw_decay(p, a, runpath)
     p.layout(a["show_fid_phase"])
     ax1, ax2, ax1b, ax3 = p.ax1, p.ax2, p.ax1b, p.ax3
     fig = p.fig
@@ -2893,6 +3604,8 @@ def write_profile_eps(path, a, aspect=None):
     EPS_WIDTH * aspect (height/width of the profile in the window), 2 to 5 in."""
     if a.get("buildup"):
         return write_buildup_eps(path, a, aspect)
+    if a.get("decay"):
+        return write_decay_eps(path, a, aspect)
     from matplotlib.backends.backend_ps import FigureCanvasPS
     on = [r for r in a["results"] if r["kind"] == "ON" and r["y"] is not None and r["freq"] is not None]
     if not on:
@@ -3108,7 +3821,9 @@ def record_label(r, multi):
     s = "%d   " % r["expno"]
     if multi:
         s += "set %d   " % r["set"]
-    if r.get("d1") is not None:
+    if r.get("t") is not None:
+        s += "reference" if r["kind"] == "ON" else "t %.0f s" % r["t"]
+    elif r.get("d1") is not None:
         s += "%s  D1 %g s" % (r["kind"], r["d1"])
     elif r["kind"] == "ON" and r["freq"] is not None:
         s += "ON %.3f GHz" % r["freq"]
@@ -3233,9 +3948,12 @@ class MainWindow:
         self.blink_on = True
 
         try:
-            self.buildup = read_run(runpath)[0].get("type") == "buildup"
+            rtype = read_run(runpath)[0].get("type")
         except Exception:
-            self.buildup = False
+            rtype = None
+        self.buildup, self.decay = rtype == "buildup", rtype == "decay"
+        self.curve = self.buildup or self.decay       # fitted curves instead of a profile
+        self.models = list(DECAY_MODELS) if self.decay else list(FIT_MODELS)
         self.root = tk.Tk()
         self.root.title("fs_plot - %s  |  %s" % (run_label(runpath), reopen))
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -3258,21 +3976,22 @@ class MainWindow:
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Label(bar, text="Also plot:").pack(side=tk.LEFT)
         self.int_var = tk.IntVar(value=0)
-        if not self.buildup:                     # build-ups: the integral is not plotted
+        if not self.curve:                       # build-ups, decays: the integral is not plotted
             ttk.Checkbutton(bar, text="window integral", variable=self.int_var,
                             command=self.on_integral).pack(side=tk.LEFT, padx=(6, 0))
         self.fph_var = tk.IntVar(value=0)
         ttk.Checkbutton(bar, text="FID phase", variable=self.fph_var,
-                        command=self.on_fid_phase).pack(side=tk.LEFT, padx=(10 if not self.buildup else 6, 0))
-        if self.buildup:                         # fit model and axes of the build-up
+                        command=self.on_fid_phase).pack(side=tk.LEFT, padx=(10 if not self.curve else 6, 0))
+        if self.curve:                           # fit model and axes of the build-up or decay
             ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
             ttk.Label(bar, text="Fit:").pack(side=tk.LEFT)
-            self.fit_combo = ttk.Combobox(bar, state="readonly", width=10, values=[FIT_SHORT[k] for k in FIT_MODELS])
+            short = DECAY_SHORT if self.decay else FIT_SHORT
+            self.fit_combo = ttk.Combobox(bar, state="readonly", width=10, values=[short[k] for k in self.models])
             self.fit_combo.pack(side=tk.LEFT, padx=(6, 0))
             self.fit_combo.current(0)
             self.fit_combo.bind("<<ComboboxSelected>>", self.on_fit_model)
             self.logd1_var = tk.IntVar(value=0)
-            ttk.Checkbutton(bar, text="log D1", variable=self.logd1_var,
+            ttk.Checkbutton(bar, text="log t" if self.decay else "log D1", variable=self.logd1_var,
                             command=self.on_buildup_axes).pack(side=tk.LEFT, padx=(8, 0))
             self.norm_var = tk.IntVar(value=0)
             ttk.Checkbutton(bar, text="normalized", variable=self.norm_var,
@@ -3285,7 +4004,7 @@ class MainWindow:
         self.err_combo.bind("<<ComboboxSelected>>", self.on_error_mode)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Label(bar, text="Export:").pack(side=tk.LEFT)
-        ttk.Button(bar, text="Build-up EPS" if self.buildup else "Profile EPS",
+        ttk.Button(bar, text="Decay EPS" if self.decay else "Build-up EPS" if self.buildup else "Profile EPS",
                    command=self.save_eps).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="CSV", width=5, command=self.export_csv).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
@@ -3315,6 +4034,24 @@ class MainWindow:
         self.fitsig_var = tk.IntVar(value=0)
         self.fitsig_cb = ttk.Checkbutton(er, text="weight the fits by 1/σ²", variable=self.fitsig_var,
                                          command=self.on_fit_sigma)
+
+        # Decay runs: equilibrium level and flip angle, in a row below the bar
+        if self.decay:
+            dr = ttk.Frame(self.root)
+            ttk.Label(dr, text="Decay fit:  S_eq").pack(side=tk.LEFT, padx=(8, 0))
+            self.seq_entry = ttk.Entry(dr, width=10)
+            self.seq_entry.pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Label(dr, text="(empty: fitted; a value fixes it, in the units of the plot)",
+                      foreground=HINT_FG).pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Label(dr, text="flip angle").pack(side=tk.LEFT, padx=(16, 0))
+            self.flip_entry = ttk.Entry(dr, width=6)
+            self.flip_entry.pack(side=tk.LEFT, padx=(4, 0))
+            self.flip_note = ttk.Label(dr, text="°", foreground=HINT_FG)
+            self.flip_note.pack(side=tk.LEFT, padx=(2, 0))
+            for e in (self.seq_entry, self.flip_entry):
+                for ev in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+                    e.bind(ev, lambda event: self.on_decay_settings())
+            dr.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 2), after=self.bar)
 
         # Bottom: the controls of the spectrum side (packed before the plots, so that they
         # keep their height when the window is made smaller)
@@ -3486,7 +4223,8 @@ class MainWindow:
                 if self.p.show_phase != layout:
                     self.toolbar.update()          # new axes: clear the zoom history
                 self.canvas.draw_idle()
-                self.info.set(buildup_info(a, self.runpath) if a["buildup"] else profile_info(a, self.runpath))
+                self.info.set(buildup_info(a, self.runpath) if a["buildup"] else
+                              decay_info(a, self.runpath) if a["decay"] else profile_info(a, self.runpath))
                 self.last_sig = sig
             self.update_records(a)
             self.int_var.set(1 if self.analyzer.phase.get("show_integral") else 0)
@@ -3501,9 +4239,18 @@ class MainWindow:
                     if ph.get(k) is not None:
                         e.insert(0, "%g" % ph[k])
             self.update_errrow()
-            if self.buildup:
+            if self.curve:
                 ph = self.analyzer.phase
-                self.fit_combo.current(list(FIT_MODELS).index(ph.get("fit_model", "mono")))
+                m = ph.get("fit_model", "mono")
+                self.fit_combo.current(self.models.index(m if m in self.models else "mono"))
+                if self.decay:
+                    focus = self.root.focus_get()
+                    for e, k in ((self.seq_entry, "s_eq"), (self.flip_entry, "flip_deg")):
+                        if e is not focus:
+                            e.delete(0, tk.END)
+                            if ph.get(k) is not None:
+                                e.insert(0, "%g" % ph[k])
+                    self.flip_note.configure(text="° (empty: %s° from the run file)" % a["meta"].get("flip_deg", "5"))
                 self.logd1_var.set(1 if ph.get("log_d1") else 0)
                 self.norm_var.set(1 if ph.get("normalize") else 0)
             self.spec.sync(a, phase_changed == "proc", self.selected_row())
@@ -3616,6 +4363,8 @@ class MainWindow:
             return
         if a["buildup"]:
             return self.on_click_buildup(event)
+        if a["decay"]:
+            return self.on_click_decay(event)
         if a["error_bars"] == "repeats" and event.inaxes in (p.ax1, p.ax1b):
             g, gi = profile_means(a)
             best, dmin = None, 30.0
@@ -3704,9 +4453,11 @@ class MainWindow:
             self.noise_box.pack(side=tk.LEFT, after=self.err_text)
         else:
             self.err_text.configure(text="mean ± standard error over the records at the same %s "
-                                         "(sets, or a repeated D1)" % ("D1" if self.buildup else "frequency"))
+                                         "(%s)" % (("time after the microwaves went off", "sets") if self.decay else
+                                                    ("D1", "sets, or a repeated D1") if self.buildup else
+                                                    ("frequency", "sets")))
             self.noise_box.pack_forget()
-        if self.buildup:
+        if self.curve:
             self.fitsig_cb.pack(side=tk.LEFT, padx=(16, 0))
         if not self.errrow_shown:
             self.errrow.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 2), after=self.bar)
@@ -3745,8 +4496,59 @@ class MainWindow:
         self.set_msg(self.analyzer.set_display(fit_sigma=bool(self.fitsig_var.get())))
         self.refresh(reschedule=False)
 
+    def on_click_decay(self, event):
+        """Left click near a point of the decay (or of the FID phase): shows that record."""
+        a, p = self.last_a, self.p
+        best, dmin = None, 30.0
+        if p.ax3 is not None and event.inaxes is p.ax3:
+            for r in a["results"]:
+                y = (r["fid"] or {}).get("phase_rel")
+                if y is None or r.get("t") is None:
+                    continue
+                xp, yp = p.ax3.transData.transform((max(decay_t(r), 1e-9), y))
+                d = math.hypot(xp - event.x, yp - event.y)
+                if d < dmin:
+                    best, dmin = r, d
+        elif event.inaxes is p.ax1:
+            view = decay_view(a["results"], a["error_bars"])
+            xs = [x for v in view.values() for x in v["x"] if x > 0]
+            x0 = (min(xs) / 3.0) if (a["log_d1"] and xs) else 0.0     # as in plot_decay
+            for key, v in view.items():
+                f = a["fits"].get(key)
+                scale = 1.0
+                if a["normalize"]:
+                    if f is None or "error" in f or not f["determined"] or not f["s0"]:
+                        continue
+                    scale = 1.0 / f["s0"]
+                for x, y, ref, rs in zip(v["x"], v["y"], v["ref"], v["recs"]):
+                    xp, yp = p.ax1.transData.transform((x0 if ref else x, y * scale))
+                    d = math.hypot(xp - event.x, yp - event.y)
+                    if d < dmin:
+                        best, dmin = max(rs, key=lambda q: q["expno"]), d
+        if best is not None and not self.show_record(best["expno"]):
+            self.set_msg("expno %d has no processed spectrum to show" % best["expno"])
+
+    def on_decay_settings(self):
+        """S_eq (fixed, or empty: fitted) and the flip angle (empty: from the run file)."""
+        vals = {}
+        for e, k in ((self.seq_entry, "s_eq"), (self.flip_entry, "flip_deg")):
+            t = e.get().strip()
+            try:
+                vals[k] = float(t) if t else None
+            except ValueError:
+                self.set_msg("%s: '%s' is not a number" % ("S_eq" if k == "s_eq" else "flip angle", t))
+                return
+        if vals["flip_deg"] is not None and not 0 < vals["flip_deg"] < 180:
+            self.set_msg("flip angle: between 0 and 180 degrees")
+            return
+        ph = self.analyzer.phase
+        if all(ph.get(k) == v for k, v in vals.items()):
+            return
+        self.set_msg(self.analyzer.set_display(**vals))
+        self.refresh(reschedule=False)
+
     def on_fit_model(self, event=None):
-        model = list(FIT_MODELS)[max(0, self.fit_combo.current())]
+        model = self.models[max(0, self.fit_combo.current())]
         self.set_msg(self.analyzer.set_display(fit_model=model))
         self.refresh(reschedule=False)
 
@@ -3760,14 +4562,14 @@ class MainWindow:
         self.refresh(reschedule=False)
 
     def save_eps(self):
-        path = eps_path(self.runpath, self.buildup)
+        path = eps_path(self.runpath, "decay" if self.decay else self.buildup)
         w = self.canvas.get_tk_widget()
         aspect = w.winfo_height() / float(max(1, w.winfo_width()))
         try:
             write_profile_eps(path, self.last_a, aspect)
             self.set_msg("Wrote %s (%.1f x %.1f in, the %s as shown, for Adobe Illustrator)"
                          % (path, EPS_WIDTH, min(5.0, max(2.0, EPS_WIDTH * aspect)),
-                            "build-up" if self.buildup else "profile"), error=False)
+                            "decay" if self.decay else "build-up" if self.buildup else "profile"), error=False)
         except Exception as ex:
             self.set_msg("Could not write %s: %s" % (path, ex))
 

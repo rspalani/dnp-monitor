@@ -1,13 +1,16 @@
-# DNP frequency profiles and build-ups
+# DNP frequency profiles, build-ups, and decays
 
-Acquisition and live display of DNP frequency profiles and build-up curves on
-the 800 MHz DNP spectrometer (TopSpin 3.6.2). For a profile, a TopSpin script
-steps the mm-wave frequency through the AWG, acquires and processes one record
-per frequency, and a viewer plots the enhancement against frequency while the
-records come in. For a build-up, a second script acquires one record per
+Acquisition and live display of DNP frequency profiles, build-up curves, and
+decays on the 800 MHz DNP spectrometer (TopSpin 3.6.2). For a profile, a TopSpin
+script steps the mm-wave frequency through the AWG, acquires and processes one
+record per frequency, and a viewer plots the enhancement against frequency while
+the records come in. For a build-up, a second script acquires one record per
 build-up time D1, at one frequency or with the microwaves off, and the viewer
-plots and fits the intensity against D1. A third TopSpin script applies the
-phase set in the viewer to the TopSpin data after a run.
+plots and fits the intensity against D1. For a decay, a third script polarizes
+with the microwaves on, switches them off, and acquires small-flip-angle records
+at set times afterwards; the viewer fits the decay back to equilibrium. Another
+TopSpin script applies the phase set in the viewer to the TopSpin data after a
+run.
 
 The headers of `fs_core.py`, `fs_plot.py`, and `fs_rephase_core.py` describe in
 detail what each program does; this page covers installation and use.
@@ -16,24 +19,27 @@ detail what each program does; this page covers installation and use.
 
 | In this folder | Installed as | What it is |
 |---|---|---|
-| `dnptools/fs_core.py` | `/opt/dnptools/fs_core.py` | Acquisition code (TopSpin/Jython), for profiles and build-ups: plan, checks, confirmation dialog, AWG commands, records, run folder, viewer |
-| `dnptools/fs_plot.py` | `/opt/dnptools/fs_plot.py` | Viewer (Python 3): profile or build-up with fits, one record at a time, phase/baseline/window, exports |
+| `dnptools/fs_core.py` | `/opt/dnptools/fs_core.py` | Acquisition code (TopSpin/Jython), for profiles, build-ups, and decays: plan, checks, confirmation dialog, AWG commands, records, run folder, viewer |
+| `dnptools/fs_plot.py` | `/opt/dnptools/fs_plot.py` | Viewer (Python 3): profile, build-up, or decay with fits, one record at a time, phase/baseline/window, exports |
 | `dnptools/fs_rephase_core.py` | `/opt/dnptools/fs_rephase_core.py` | Post-run phasing of the TopSpin data with the viewer's phase |
 | `dnptools/awg_cmd.py` | `/opt/dnptools/awg_cmd.py` | Sends one command to the AWG control server (set its address; see below) |
 | `topspin/fs.py` | `/opt/topspin3.6.2/exp/stan/nmr/py/user/fs.py` | TopSpin command `fs <name>` (profile) |
 | `topspin/bu.py` | `/opt/topspin3.6.2/exp/stan/nmr/py/user/bu.py` | TopSpin command `bu <name>` (build-up) |
+| `topspin/decay.py` | `/opt/topspin3.6.2/exp/stan/nmr/py/user/decay.py` | TopSpin command `decay <name>` (decay) |
 | `topspin/fs_rephase.py` | `/opt/topspin3.6.2/exp/stan/nmr/py/user/fs_rephase.py` | TopSpin command `fs_rephase` |
 | `settings/settings_template.py` | `/opt/nmrdata/fs_settings/` | Template for the settings files, one per kind of experiment |
 | `settings/settings_p1.py`, `settings_bdpa.py`, `settings_nox.py` | `/opt/nmrdata/fs_settings/` | Settings for the P1 diamond, BDPA, and m-TinyPol profiles |
 | `settings/buildup_template.py` | `/opt/nmrdata/fs_settings/` | Template for the build-up settings files |
 | `settings/buildup_p1.py`, `buildup_bdpa.py`, `buildup_nox.py` | `/opt/nmrdata/fs_settings/` | Build-up settings for the same samples (set `FREQ` before the first run) |
+| `settings/decay_template.py` | `/opt/nmrdata/fs_settings/` | Template for the decay settings files |
+| `settings/decay_p1.py` | `/opt/nmrdata/fs_settings/` | Decay settings for the P1 diamond at 100 K (set `FREQ` before the first run) |
 
 The TopSpin scripts only start the code in `/opt/dnptools` (with `execfile`,
 so that TopSpin always runs the current version without being restarted).
 
 ## Requirements
 
-- TopSpin 3.6.2 (its Jython 2.7 runs `fs.py`, `bu.py`, and `fs_rephase.py`).
+- TopSpin 3.6.2 (its Jython 2.7 runs `fs.py`, `bu.py`, `decay.py`, and `fs_rephase.py`).
 - `python` on the PATH, Python 2.7 or 3, for `awg_cmd.py`.
 - For the viewer: `/usr/bin/python3` (3.6 or newer) with `numpy`, `matplotlib`
   (3.3 or newer), and `python3-tk`. Without a display the viewer writes its
@@ -56,9 +62,9 @@ sudo cp -n dnptools/awg_cmd.py /opt/dnptools/
 sudo chmod a+r /opt/dnptools/*.py
 
 # TopSpin commands
-sudo cp topspin/fs.py topspin/bu.py topspin/fs_rephase.py /opt/topspin3.6.2/exp/stan/nmr/py/user/
+sudo cp topspin/fs.py topspin/bu.py topspin/decay.py topspin/fs_rephase.py /opt/topspin3.6.2/exp/stan/nmr/py/user/
 sudo chmod a+r /opt/topspin3.6.2/exp/stan/nmr/py/user/fs.py /opt/topspin3.6.2/exp/stan/nmr/py/user/bu.py \
-               /opt/topspin3.6.2/exp/stan/nmr/py/user/fs_rephase.py
+               /opt/topspin3.6.2/exp/stan/nmr/py/user/decay.py /opt/topspin3.6.2/exp/stan/nmr/py/user/fs_rephase.py
 
 # settings (-n: settings files already on the spectrometer are kept)
 sudo mkdir -p /opt/nmrdata/fs_settings
@@ -150,6 +156,68 @@ planned record with its expected duration (the viewer uses it for the expected
 end). A profile settings file given to `bu`, or a build-up file given to `fs`,
 is refused with a message that says which command to use.
 
+## Running a decay
+
+A decay follows the polarization back to equilibrium after the microwaves are
+switched off. One run (per set, `REPEATS` sets one after the other):
+
+1. `cw FREQ POWER` is sent to the AWG and the sample polarizes for
+   `POLARIZE_TIME` s.
+2. A reference record is acquired with the microwaves still on: the
+   steady-state signal.
+3. `stop` is sent to the AWG; this is t = 0.
+4. One record is acquired at each time in `TIMES_LIST` after t = 0. The script
+   copies the template, sets D1 so that the pulse comes at the target time, and
+   writes the time actually reached to `run.txt`.
+
+Every record has NS 1 and DS 0. The template's pulse program must not saturate,
+and its pulse should be a small flip angle (e.g. 5°), so that each record uses
+only a small part of the polarization: cos(flip angle) of it remains after each
+pulse (16 pulses of 5° leave 0.94), and the viewer corrects for this. Set RG in
+the template for the reference, the largest signal of the run.
+
+1. Make a decay settings file, or use `decay_p1.py`:
+
+   ```bash
+   cp /opt/nmrdata/fs_settings/decay_template.py /opt/nmrdata/fs_settings/decay_<name>.py
+   ```
+
+   It has the same dataset, template, and live-plot settings as a build-up,
+   and instead of the D1 values:
+   - `FREQ` (GHz) and `POWER`: the AWG's `cw` command for the polarization
+     (`FREQ = None` in the files here, so that a run cannot start before a
+     frequency is chosen).
+   - `POLARIZE_TIME`: s from `cw` to the reference pulse, about 5 times T_B.
+   - `TIMES_LIST`: the target times in s after t = 0, increasing;
+     `logspace(first, last, n)` gives `n` log-spaced values. Out to about 3 T1
+     lets the viewer fit the equilibrium level as well.
+   - `FLIP_DEG`: the template's flip angle, written to the run file for the
+     viewer's correction.
+
+   `decay_p1.py`: 3 h of polarization and 15 records from 30 s to 9000 s,
+   about 5.5 h in all.
+2. In TopSpin, type `decay <name>` (`decay` alone lists the decay settings
+   files). If `decay` runs something else on this TopSpin, the name is taken:
+   rename `decay.py` and type the new name instead.
+3. The confirmation dialog lists the plan, the mm-wave setting, the target
+   times (with a warning when some are closer together than a record can be
+   set up), and the expected duration.
+
+Timing: each record needs a few seconds besides D1 (copying the template,
+setting parameters, starting `zg`, processing). The script measures this
+latency on every record (from the end of acquisition less AQ) and uses the
+median so far for the next D1, starting from `ZG_LATENCY`. A target that comes
+sooner than the previous record allows is taken as soon as possible, logged,
+and recorded with its actual time. Times are accurate to about a second, so
+decays of a minute or longer are followed well; faster decays need a pseudo-2D
+pulse program instead.
+
+The run folder is labelled `decay_<name>`; `run.txt` has `# type = decay`, the
+flip angle, and for each record its D1, its time t after the microwaves went
+off, and the target time. A decay file given to `fs` or `bu`, or another
+settings file given to `decay`, is refused with a message that says which
+command to use.
+
 ## The viewer
 
 It opens by itself during a run; to open it later, for any run:
@@ -236,6 +304,40 @@ axis on the right.
   the next record is overdue, so a long record late in the run is not reported
   as a problem.
 
+### Decay runs in the viewer
+
+The viewer plots the intensity per scan (or FID(t0)) against the time after
+the microwaves went off: the reference as an open diamond at t = 0 (drawn at
+the left edge with "log t"), the decay records as filled circles, each set
+with its fitted curve.
+
+- "Fit" chooses the model; each record is corrected for the pulses before it
+  (cos(flip angle) each):
+  - mono-exponential (default), S_eq + (S₀ − S_eq)·exp(−t/T₁), exact including
+    the thermal polarization that the pulses also take;
+  - stretched exponential, S_eq + (S₀ − S_eq)·exp(−(t/T₁)^β);
+  - bi-exponential, S_eq + S₁·exp(−t/T₁) + S₂·exp(−t/T₂).
+- The plot shows the fitted curve as sampled (solid) and the decay without the
+  pulses' losses (dotted), which is what T₁ describes. In a simulated run
+  (T₁ 300 s, 15 pulses of 5° from 10 to 1500 s), leaving out the correction
+  gave a T₁ 5% too short.
+- The row below the top bar has "S_eq" and "flip angle". S_eq empty: fitted. A
+  value fixes it, in the units of the plot (intensity per scan, or FID(t0) per
+  NS·RG), for a decay not followed long enough to fit it; the fit row says when
+  the last time is too short for S_eq to be fitted well. A record of the same
+  template at thermal equilibrium, with more scans, gives this value. The flip
+  angle, empty, is the one in the run file.
+- The fit row gives T₁ (or T₁ and T₂), S₀, S_eq, and S₀/S_eq, the
+  enhancement left at t = 0 relative to equilibrium. A "Timing" row says how
+  close the records came to their target times.
+- "normalized" divides each set by its fitted S₀. Error bars, the 1/σ²
+  weights, the record pane, FID(t0), and the exports work as for a build-up;
+  "Export: Decay EPS" writes `decay.eps`, `values.tsv` has t and the fitted
+  value of each record, and `records.csv` has `d1_s`, `t_s`, and `target_s`.
+- With `extreme` or `max`, weak points are biased upward by noise (the largest
+  of many noisy points); for a tail near the noise level, `sum` or FID(t0) is
+  unbiased.
+
 ### Error bars
 
 "Error bars" in the top bar adds error bars to the profile or the build-up, in
@@ -255,9 +357,10 @@ error bars off, everything is as before.
   start OFF is included. The spectrum pane shows the σ of the record shown.
 - **repeats**: the mean of the records at the same frequency (profile) or D1
   (build-up, ON and OFF separately), over the sets of a run with `REPEATS` > 1
-  or a D1 that appears more than once, ± its standard error. The sets are then
+  or a D1 that appears more than once, or of the k-th record of each set
+  (decay), ± its standard error. The sets are then
   shown as one series. A point measured once has no bar.
-- For build-ups, "weight the fits by 1/σ²" (in the same row) fits with these
+- For build-ups and decays, "weight the fits by 1/σ²" (in the same row) fits with these
   errors instead of NS and takes the parameter errors from them; the fit row
   then shows χ²/dof, which is about 1 when the noise explains the scatter, and
   a note when the scatter is clearly larger. With repeats, this needs at least
@@ -272,4 +375,4 @@ Set the phase in the viewer and press "Apply to all records"; this writes
 TopSpin's phase convention on the first record, checks that it reproduces the
 viewer's phase, asks for confirmation, and reprocesses every record with the
 new PHC0 and PHC1. Everything is logged in `rephase.log` in the run folder.
-This works for build-up runs as well.
+This works for build-up and decay runs as well.
